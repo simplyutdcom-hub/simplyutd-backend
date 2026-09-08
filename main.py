@@ -58,3 +58,19 @@ def join_waitlist(entry: WaitlistEntry) -> SignupResponse:
         email_ok = True
 
     return SignupResponse(message=message, email_sent=email_ok)
+
+
+class TestEmailRequest(BaseModel):
+    email: EmailStr
+
+
+class TestEmailResponse(BaseModel):
+    sent: bool
+    detail: str
+
+
+@app.post("/api/test-email", response_model=TestEmailResponse)
+def test_email(req: TestEmailRequest) -> TestEmailResponse:
+    """Send a test email to any address to confirm Resend delivery."""
+    ok, detail = mailer.send_test_email(req.email.lower())
+    return TestEmailResponse(sent=ok, detail=detail)

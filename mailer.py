@@ -57,9 +57,18 @@ def _send(subject: str, to: str, html: str, text: str) -> tuple[bool, str]:
         _log(f"SENT OK: '{subject}' -> {to}")
         return True, "Email sent."
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode(errors="replace")
-        _log(f"FAILED: '{subject}' -> {to} (Resend API error {exc.code}): {body}")
-        return False, f"Resend API error {exc.code}: {body}"
+        raw = exc.read().decode(errors="replace")
+        # Resend returns JSON like {"statusCode":..., "name":..., "message":...}.
+        try:
+            err = json.loads(raw)
+            detail = err.get("message") or raw
+            name = err.get("name")
+            extra = f" [{name}]" if name else ""
+            human = f"{detail}{extra}"
+        except (ValueError, AttributeError):
+            human = raw or exc.reason or f"HTTP {exc.code}"
+        _log(f"FAILED: '{subject}' -> {to} (Resend {exc.code}): {human}")
+        return False, f"Resend API error {exc.code}: {human}"
     except Exception as exc:  # noqa: BLE001 - surface any failure to caller
         _log(f"FAILED: '{subject}' -> {to}: {exc}")
         return False, f"Failed to send email: {exc}"
@@ -202,3 +211,44 @@ def send_signup_notification(email: str) -> tuple[bool, str]:
     </html>
     """
     return _send(subject, NOTIFY_TO, html, text)
+
+
+def send_test_email(to: str) -> tuple[bool, str]:
+    """Send a simple test message to confirm Resend delivery."""
+    subject = "SimplyUtd waitlist — email test ✅"
+    text = (
+        "This is a test email from your SimplyUtd waitlist backend.\n\n"
+        "If you can read this, email delivery is working end to end.\n\n"
+        "— The SimplyUtd team"
+    )
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <body style="margin:0;padding:0;background-color:{BLACK};">
+    <center>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
+           style="background-color:{BLACK};">
+      <tr><td align="center" style="padding:32px 16px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
+               style="max-width:480px;width:100%;background-color:{DARK};
+                      border-radius:16px;overflow:hidden;">
+          {_logo()}
+          <tr>
+            <td style="padding:24px 28px;">
+              <h1 style="margin:0 0 12px 0;font-family:Georgia,serif;font-size:22px;
+                         color:{WHITE};">Email test</h1>
+              <p style="margin:0;font-family:Inter,Arial,sans-serif;font-size:14px;
+                        line-height:1.7;color:#E6E6E6;">
+                If you can read this, email delivery is working end to end.&nbsp;
+                <span style="color:{WHITE};">⚽</span>
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td></tr>
+    </table>
+    </center>
+    </body>
+    </html>
+    """
+    return _send(subject, to, html, text)
