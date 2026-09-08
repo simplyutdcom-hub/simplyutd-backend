@@ -1,6 +1,8 @@
 import json
+import sys
 import urllib.error
 import urllib.request
+from datetime import datetime
 
 from config import NOTIFY_TO, RESEND_API_KEY, RESEND_API_URL, RESEND_FROM
 
@@ -16,9 +18,16 @@ def _is_configured() -> bool:
     return bool(RESEND_API_KEY and RESEND_FROM)
 
 
+def _log(msg: str) -> None:
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[mailer {ts}] {msg}", flush=True)
+
+
 def _send(subject: str, to: str, html: str, text: str) -> tuple[bool, str]:
     """Send a branded (HTML + plain text) email via the Resend HTTPS API."""
     if not _is_configured():
+        missing = [k for k, v in (("RESEND_API_KEY", RESEND_API_KEY), ("RESEND_FROM", RESEND_FROM)) if not v]
+        _log(f"BLOCKED: {', '.join(missing)} not set — skipped email to {to}: '{subject}'")
         return False, "Resend not configured — skipped email."
 
     payload = json.dumps(
@@ -41,13 +50,18 @@ def _send(subject: str, to: str, html: str, text: str) -> tuple[bool, str]:
         },
     )
 
+    _log(f"Sending '{subject}' -> {to} (from {RESEND_FROM})")
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             resp.read()
+        _log(f"SENT OK: '{subject}' -> {to}")
         return True, "Email sent."
     except urllib.error.HTTPError as exc:
-        return False, f"Resend API error {exc.code}: {exc.read().decode(errors='replace')}"
+        body = exc.read().decode(errors="replace")
+        _log(f"FAILED: '{subject}' -> {to} (Resend API error {exc.code}): {body}")
+        return False, f"Resend API error {exc.code}: {body}"
     except Exception as exc:  # noqa: BLE001 - surface any failure to caller
+        _log(f"FAILED: '{subject}' -> {to}: {exc}")
         return False, f"Failed to send email: {exc}"
 
 
