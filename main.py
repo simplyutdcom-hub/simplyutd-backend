@@ -1,4 +1,7 @@
 from contextlib import asynccontextmanager
+import json
+import urllib.request
+import urllib.error
 
 from fastapi import FastAPI, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,6 +9,31 @@ from pydantic import BaseModel, EmailStr
 
 import mailer
 import storage
+
+
+def _probe(url: str, method: str = "GET", headers=None, data=None) -> dict:
+    """Make a raw HTTP request from the server and report status/body/headers."""
+    try:
+        req = urllib.request.Request(url, method=method, headers=headers or {}, data=data)
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = resp.read().decode(errors="replace")
+            return {
+                "url": url,
+                "status": resp.status,
+                "ok": True,
+                "body": body[:500],
+                "server": resp.headers.get("Server", ""),
+            }
+    except urllib.error.HTTPError as exc:
+        return {
+            "url": url,
+            "status": exc.code,
+            "ok": False,
+            "body": exc.read().decode(errors="replace")[:500],
+            "server": exc.headers.get("Server", "") if exc.headers else "",
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"url": url, "ok": False, "error": str(exc)}
 
 
 @asynccontextmanager
@@ -74,3 +102,22 @@ def test_email(req: TestEmailRequest) -> TestEmailResponse:
     """Send a test email to any address to confirm Resend delivery."""
     ok, detail = mailer.send_test_email(req.email.lower())
     return TestEmailResponse(sent=ok, detail=detail)
+
+
+@app.get("/api/diag")
+def diag() -> dict:
+    """Raw egress probes to diagnose why Resend calls fail from Render."""
+    key = mailer.RESEND_API_KEY
+    results = []
+    # 1) A plain site to confirm general egress works.
+    results.append(_probe("https://example.com"))
+    # 2) Resend's domains endpoint with the real key — shows the raw response.
+    results.append(
+        _probe(
+            "https://api.resend.com/domains",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+    )
+    # 3) Resend's root API endpoint with no auth (to see raw 401 JSON).
+    results.append(_probe("https://api.resend.com/emails"))
+    return {"configured": bool(key), "probes": results}
