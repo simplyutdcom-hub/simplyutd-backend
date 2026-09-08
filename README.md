@@ -6,7 +6,11 @@ A small [FastAPI](https://fastapi.tiangolo.com/) backend for the SimplyUtd
 1. Validates and stores their email in **MongoDB** (or local SQLite in dev).
 2. Sends the registrant a branded **welcome email** (matching the SimplyUtd
    black / white / red UI) confirming they're on the list.
-3. Sends you a **notification email** via Gmail SMTP so you know who signed up.
+3. Sends you a **notification email** via Resend so you know who signed up.
+
+Email is delivered through [**Resend**](https://resend.com)'s HTTPS API rather
+than SMTP, because Render's **free** instances block outbound SMTP (ports
+25/465/587) but allow HTTPS (port 443).
 
 ## Storage
 
@@ -21,20 +25,20 @@ Emails are stored with a unique index, so duplicates are rejected.
 
 ## Local setup
 
-### 1. Configure Gmail SMTP
+### 1. Configure Resend email
 
-Gmail won't accept your normal password over SMTP. Create an **App Password**:
-
-1. Enable **2-Step Verification** in your Google Account.
-2. **Google Account → Security → App passwords** → create one for `simplyutd`.
-3. Copy the 16-character password into `.env`.
+1. Create a free account at [resend.com](https://resend.com) and generate an
+   **API key** (`re_...`).
+2. **For testing:** leave `RESEND_FROM` as `SimplyUtd <onboarding@resend.dev>`
+   — Resend's sandbox lets you send to your own inbox. To email real
+   subscribers you must add and verify a **domain** (Resend → Domains) and set
+   `RESEND_FROM` to an address on it (e.g. `no-reply@yourdomain.com`).
 
 ```bash
-cp .env.example .env   # then edit: SMTP_EMAIL, SMTP_APP_PASSWORD, NOTIFY_TO
+cp .env.example .env   # then edit: RESEND_API_KEY, RESEND_FROM, NOTIFY_TO
 ```
 
-`NOTIFY_TO` is the inbox that receives signup notifications. Leave blank to
-send to `SMTP_EMAIL`.
+`NOTIFY_TO` is the inbox that receives "new signup" notifications to you.
 
 ### 2. Install and run
 
@@ -60,7 +64,7 @@ API: `http://localhost:8000`
 ```
 
 - Duplicate emails return an "already on the list" message and don't re-notify.
-- If SMTP isn't configured the signup is still stored and `email_sent` is `false`.
+- If Resend isn't configured the signup is still stored and `email_sent` is `false`.
 
 ## Hosting on Render
 
@@ -70,9 +74,11 @@ Deploy **two** things: the React frontend (Static Site) and this backend (Web Se
 1. Render → **New → Web Service** → connect your repo.
 2. **Root Directory:** `backend` (if it's in a subfolder of the repo).
 3. **Build Command:** `pip install -r requirements.txt`
-4. **Start Command:** `uvicorn main:app --host 0.0.0.0 --port 10000`
+4. **Start Command:** `uvicorn main:app --host 0.0.0.0 --port $PORT`
 5. **Environment Variables** (never commit `.env`):
-   - `SMTP_EMAIL`, `SMTP_APP_PASSWORD`, `NOTIFY_TO`
+   - `RESEND_API_KEY` — from [resend.com/api-keys](https://resend.com/api-keys)
+   - `RESEND_FROM` — e.g. `SimplyUtd <no-reply@yourdomain.com>` (see above)
+   - `NOTIFY_TO` — your inbox for signup notifications
    - `MONGO_URI` — from **Render's MongoDB** or [MongoDB Atlas](https://www.mongodb.com/atlas)
    - optionally `MONGO_DB`
 

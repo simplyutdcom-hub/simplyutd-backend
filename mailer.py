@@ -1,8 +1,8 @@
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+import json
+import urllib.error
+import urllib.request
 
-from config import NOTIFY_TO, SMTP_APP_PASSWORD, SMTP_EMAIL, SMTP_HOST, SMTP_PORT
+from config import NOTIFY_TO, RESEND_API_KEY, RESEND_API_URL, RESEND_FROM
 
 # SimplyUtd brand colours (mirror the site UI).
 RED = "#DA291C"
@@ -13,28 +13,41 @@ MUTED = "#AAAAAA"
 
 
 def _is_configured() -> bool:
-    return bool(SMTP_EMAIL and SMTP_APP_PASSWORD)
+    return bool(RESEND_API_KEY and RESEND_FROM)
 
 
 def _send(subject: str, to: str, html: str, text: str) -> tuple[bool, str]:
-    """Send a multipart (HTML + plain text) email via Gmail SMTP."""
+    """Send a branded (HTML + plain text) email via the Resend HTTPS API."""
     if not _is_configured():
-        return False, "SMTP not configured — skipped email."
+        return False, "Resend not configured — skipped email."
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = f"SimplyUtd <{SMTP_EMAIL}>"
-    msg["To"] = to
-    msg.attach(MIMEText(text, "plain"))
-    msg.attach(MIMEText(html, "html"))
+    payload = json.dumps(
+        {
+            "from": RESEND_FROM,
+            "to": [to],
+            "subject": subject,
+            "html": html,
+            "text": text,
+        }
+    ).encode("utf-8")
+
+    req = urllib.request.Request(
+        RESEND_API_URL,
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
 
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
-            server.starttls()
-            server.login(SMTP_EMAIL, SMTP_APP_PASSWORD)
-            server.send_message(msg)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp.read()
         return True, "Email sent."
-    except Exception as exc:  # noqa: BLE001 - surface any SMTP failure to caller
+    except urllib.error.HTTPError as exc:
+        return False, f"Resend API error {exc.code}: {exc.read().decode(errors='replace')}"
+    except Exception as exc:  # noqa: BLE001 - surface any failure to caller
         return False, f"Failed to send email: {exc}"
 
 
