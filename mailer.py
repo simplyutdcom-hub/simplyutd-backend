@@ -47,6 +47,11 @@ def _send(subject: str, to: str, html: str, text: str) -> tuple[bool, str]:
         headers={
             "Authorization": f"Bearer {RESEND_API_KEY}",
             "Content-Type": "application/json",
+            # Resend's Cloudflare bot protection returns "error code: 1010" for
+            # urllib's default "Python-urllib/x.y" User-Agent. A browser-like UA
+            # is required to reach the API.
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
         },
     )
 
