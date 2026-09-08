@@ -80,9 +80,11 @@ Render gives you a URL like `https://<name>.onrender.com`. Because MongoDB is
 managed outside Render's ephemeral disk, signups persist across restarts.
 
 ### Frontend → Render Static Site
-Build command `npm run build` (outputs `dist/`). Set the API base URL so `/api`
-calls hit your Render backend, and restrict the backend's CORS to your real
-frontend domain (currently `allow_origins=["*"]` for dev).
+Build command `npm run build` (outputs `dist/`). The API base URL comes from
+`VITE_API_URL` (see [.env.production](../.env.production), which Vite loads
+during production builds and points at your Render backend). For good measure,
+restrict the backend's CORS to your real frontend domain (currently
+`allow_origins=["*"]` for dev).
 
 ## Viewing signups
 
