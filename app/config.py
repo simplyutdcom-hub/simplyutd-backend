@@ -148,10 +148,25 @@ class Settings:
         # timeline is read from Nitter RSS mirrors instead: unofficial, so a
         # pool of instances is tried in order and the read is cached.
         self.x_handle = os.getenv("X_HANDLE", "SimplyUtd").strip().lstrip("@") or "SimplyUtd"
+        # Curated mirrors, tried in order. Instances die often enough that a
+        # static pool alone goes stale, so the pool is topped up from a status
+        # service (below) whenever every one of these refuses.
         self.x_rss_instances = _list(
             "X_RSS_INSTANCES",
-            "https://nitter.kareem.one,https://nitter.thepixora.com,https://twiiit.com",
+            "https://nitter.jaydenha.uk,https://nitter.kareem.one,https://nitter.thepixora.com,https://twiiit.com",
         )
+        # A public status board that polls the Nitter instances and reports which
+        # are up and which still serve RSS. Read only when the curated pool fails,
+        # so it can never delay a read that already worked.
+        self.x_rss_discovery_enabled = _bool("X_RSS_DISCOVERY_ENABLED", True)
+        self.x_rss_discovery_url = os.getenv(
+            "X_RSS_DISCOVERY_URL", "https://status.d420.de/api/v1/instances"
+        ).strip()
+        # How long a successful discovery is trusted, and how long a failed one
+        # is left alone before another attempt (a status board that is briefly
+        # down must not be hammered by every poll).
+        self.x_rss_discovery_seconds = _int("X_RSS_DISCOVERY_SECONDS", 1800)
+        self.x_rss_discovery_retry_seconds = _int("X_RSS_DISCOVERY_RETRY_SECONDS", 120)
         # Short: the panel is meant to read as "live" and Nitter is cheap to poll.
         self.x_cache_seconds = _int("X_CACHE_SECONDS", 180)
         # The panel polls for new posts, so a poll that finds a read older than

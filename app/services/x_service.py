@@ -6,12 +6,15 @@ Nitter - an unofficial third-party mirror that renders a profile as RSS.
 
 Instances come and go, so a pool is tried in order and the first instance that
 returns a readable feed wins; the read is then cached because every visit to the
-home page asks for it. The panel polls for new posts, so the cache is served
-while it is fresh, refreshed in the background while it is merely stale, and
-only read through to a mirror once it has expired. Like the other upstream
-integrations this never raises: a total failure returns what is cached, or
-nothing, and the panel shows an empty state. Nitter exposes no engagement
-counts, so a post carries its text, author, media and timestamp only.
+home page asks for it. When every mirror in that pool refuses - which is what a
+stale pool looks like - the pool is topped up from a public status board of
+Nitter instances (:func:`discover_instances`), so a new mirror is found without
+a code change. The panel polls for new posts, so the cache is served while it is
+fresh, refreshed in the background while it is merely stale, and only read
+through to a mirror once it has expired. Like the other upstream integrations
+this never raises: a total failure returns what is cached, or nothing, and the
+panel shows an empty state. Nitter exposes no engagement counts, so a post
+carries its text, author, media and timestamp only.
 """
 from __future__ import annotations
 
@@ -247,8 +250,10 @@ _refreshing = False
 
 def reset_cache() -> None:
     """Clear the cached timeline and profile (used by tests)."""
-    global _refreshing
+    global _refreshing, _discovered, _discovered_expires
     _refreshing = False
+    _discovered = []
+    _discovered_expires = 0.0
     _cache.posts = None
     _cache.profile = None
     _cache.expires = 0.0
@@ -274,6 +279,66 @@ def _get(url: str, accept: str) -> str | None:
         logger.debug("X feed fetch returned %s: %s", response.status_code, url)
         return None
     return response.text or None
+
+
+# --- Mirror discovery ------------------------------------------------------ #
+
+# Nitter instances come and go - the pool in the config went stale and left the
+# panel empty - so whenever every curated mirror refuses, the pool is topped up
+# from a status board that probes the instances and reports which still answer
+# and which still serve RSS. A successful lookup is trusted for half an hour;
+# a failed one is left alone for a couple of minutes so a status board that is
+# itself down is not asked once per poll.
+_discovered: list[str] = []
+_discovered_expires: float = 0.0
+
+
+def _instances_from_status(payload: str | None) -> list[str]:
+    """The RSS-capable, answering instance URLs in a status-board response."""
+    if not payload:
+        return []
+    try:
+        hosts = json.loads(payload).get("hosts") or []
+    except (ValueError, AttributeError):
+        logger.debug("Nitter instance status was not the expected JSON")
+        return []
+
+    # The board lists whichever instances it found first; ones it is happy with
+    # are the likeliest to serve a feed, so they are tried first.
+    healthy: list[str] = []
+    rest: list[str] = []
+    for host in hosts:
+        if not isinstance(host, dict) or host.get("is_bad_host") or not host.get("rss"):
+            continue
+        # "healthy" trails the pings by a check or two, so an instance that
+        # answered a recent ping counts even before it is flagged healthy -
+        # anything that is not really up is dropped when its RSS is read.
+        if not any(ping for ping in (host.get("recent_pings") or [])[-3:]):
+            continue
+        url = str(host.get("url") or "").strip().rstrip("/")
+        if not url.startswith("http") and host.get("domain"):
+            url = f"https://{str(host['domain']).strip().rstrip('/')}"
+        if not url.startswith("http") or url in healthy or url in rest:
+            continue
+        (healthy if host.get("healthy") else rest).append(url)
+    return healthy + rest
+
+
+def discover_instances() -> list[str]:
+    """The mirror pool the status board advertises, cached between lookups."""
+    global _discovered, _discovered_expires
+    now = time.monotonic()
+    if now < _discovered_expires:
+        return _discovered
+    found = _instances_from_status(_get(settings.x_rss_discovery_url, "application/json"))
+    if found:
+        logger.debug("Nitter instance discovery returned %d mirrors", len(found))
+        _discovered = found
+        _discovered_expires = now + settings.x_rss_discovery_seconds
+    else:
+        logger.debug("Nitter instance discovery found nothing usable")
+        _discovered_expires = now + settings.x_rss_discovery_retry_seconds
+    return _discovered
 
 
 # --- Playable media -------------------------------------------------------- #
@@ -420,6 +485,33 @@ def open_video_stream(url: str, range_header: str | None = None) -> UpstreamVide
     return UpstreamVideo(upstream.status_code, headers, relay(), release)
 
 
+# A dead mirror usually refuses the connection outright, but one that hangs
+# would hold the panel's request open, so the walk gets a wall-clock budget and
+# a ceiling on how many mirrors it will try. Everything here is a fallback: a
+# mirror that answers is read long before either limit matters.
+_WALK_BUDGET_SECONDS = 20.0
+_MAX_MIRRORS = 6
+
+
+def _mirror_pool(deadline: float) -> Iterator[str]:
+    """The mirrors to try: the curated ones first, then the discovered ones.
+
+    Lazy on purpose - the status board is only asked once the curated mirrors
+    have all refused, so a pool that still works never waits on it.
+    """
+    seen: set[str] = set()
+    for base in settings.x_rss_instances:
+        seen.add(base)
+        yield base
+    if not settings.x_rss_discovery_enabled or not settings.x_rss_discovery_url:
+        return
+    if time.monotonic() >= deadline:
+        return
+    for base in discover_instances():
+        if base not in seen:
+            yield base
+
+
 def fetch_timeline(force: bool = False) -> ParsedFeed:
     """The most recent posts, cached for ``x_cache_seconds``.
 
@@ -435,7 +527,17 @@ def fetch_timeline(force: bool = False) -> ParsedFeed:
             posts=_cache.posts,
         )
 
-    for base in settings.x_rss_instances:
+    # A dead mirror usually refuses the connection outright, but one that hangs
+    # would hold the panel's request open, so the walk is capped and budgeted
+    # rather than asking every mirror for its full timeout.
+    deadline = now + _WALK_BUDGET_SECONDS
+    for index, base in enumerate(_mirror_pool(deadline)):
+        if index >= _MAX_MIRRORS:
+            logger.debug("Giving up on the Nitter pool after %d mirrors", index)
+            break
+        if time.monotonic() >= deadline:
+            logger.debug("Giving up on the Nitter pool: the walk ran out of time")
+            break
         url = f"{base.rstrip('/')}/{settings.x_handle}/rss"
         body = _get(url, "application/rss+xml, application/xml, text/xml")
         if not body:
