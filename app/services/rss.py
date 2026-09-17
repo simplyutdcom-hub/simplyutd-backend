@@ -17,6 +17,7 @@ import httpx
 
 from ..config import settings
 from ..utils import parse_datetime, strip_html
+from . import classify
 
 logger = logging.getLogger("simplyutd.rss")
 
@@ -100,6 +101,10 @@ def normalize_entry(entry: dict, feed_title: str = "", category: str = "News") -
     summary = strip_html(summary_html)
     tags = [strip_html(t.get("term", "")) for t in (entry.get("tags") or []) if isinstance(t, dict)]
     tags = [t for t in tags if t][:8]
+    # Feeds do not ship a usable section, so derive one from what they did send.
+    # An explicit non-default category stays as given.
+    if category == classify.DEFAULT_CATEGORY:
+        category = classify.classify(title, summary, tags)
     return FeedEntry(
         title=title[:300],
         link=link,

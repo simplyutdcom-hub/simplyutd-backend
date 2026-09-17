@@ -5,8 +5,9 @@ Nothing here is fabricated. Two real sources feed the Hub:
 * the RSS news corpus already in Mongo (match reports and previews), from which
   we parse *facts* only - scorelines, the two clubs, the competition;
 * Wikipedia's current-season ``Squad statistics`` for the United squad,
-  appearances and goals, and its ``Sports table`` module for the Premier League
-  table (see :mod:`app.services.wikipedia`).
+  appearances and goals, its ``Sports table`` module for the Premier League
+  table, and its season article's match tables for the real fixture list (see
+  :mod:`app.services.wikipedia`).
 
 Prose from publishers is never republished - we only extract structured facts
 that are not themselves copyrightable (a 2-1 scoreline, a fixture pairing).
@@ -17,15 +18,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 from .. import db as db_module
 from ..config import settings
-from . import feed_rank, wikipedia
+from . import feed_rank, form_service, wikipedia
 from .seed import PLAYER_IMAGES
 
 logger = logging.getLogger("simplyutd.hub")
+
+# Guards :func:`revalidate` so a burst of hub reads starts one Wikipedia refresh.
+_revalidating = False
 
 # --------------------------------------------------------------------------- #
 # Clubs
@@ -133,6 +137,32 @@ VENUES: dict[str, str] = {
     "city ground": "Nottingham Forest",
     "elland road": "Leeds",
     "stadium of light": "Sunderland",
+}
+
+# Club -> the ground it plays its home games on, as we spell it in the UI. Used
+# to name the venue of United's away fixtures, which the season article leaves
+# blank. Clubs we have no reliable ground for are simply omitted.
+GROUNDS: dict[str, str] = {
+    "Manchester United": "Old Trafford",
+    "Arsenal": "Emirates Stadium",
+    "Aston Villa": "Villa Park",
+    "Bournemouth": "Vitality Stadium",
+    "Brentford": "Gtech Community Stadium",
+    "Brighton": "Amex Stadium",
+    "Chelsea": "Stamford Bridge",
+    "Coventry": "Coventry Building Society Arena",
+    "Crystal Palace": "Selhurst Park",
+    "Everton": "Hill Dickinson Stadium",
+    "Fulham": "Craven Cottage",
+    "Hull": "MKM Stadium",
+    "Ipswich": "Portman Road",
+    "Leeds": "Elland Road",
+    "Liverpool": "Anfield",
+    "Manchester City": "Etihad Stadium",
+    "Newcastle": "St James' Park",
+    "Nottingham Forest": "City Ground",
+    "Sunderland": "Stadium of Light",
+    "Tottenham": "Tottenham Hotspur Stadium",
 }
 
 _YOUTH_RE = re.compile(r"\b(U\d{2}s?|Academy|Women|Youth|Reserves?)\b", re.IGNORECASE)
@@ -482,6 +512,100 @@ def derive_fixtures(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return fixtures
 
 
+# The fixtures and results panels show the whole season: every match United
+# have played and every one they have still to play, all of it from the season
+# article rather than a truncated window.
+
+
+_SEASON_LABEL_RE = re.compile(r"(\d{4})\s*[\u2013\u2014-]\s*(\d{2,4})")
+_UNITED_OUTCOME = {"W": "win", "D": "draw", "L": "loss"}
+
+
+def _season_label() -> str:
+    """``2026–27 Manchester United F.C. season`` -> ``2026/27``."""
+    match = _SEASON_LABEL_RE.search(settings.hub_season_page or "")
+    if not match:
+        return ""
+    return f"{match.group(1)}/{match.group(2)[-2:]}"
+
+
+def _ordinal(value: int) -> str:
+    if 10 <= value % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(value % 10, "th")
+    return f"{value}{suffix}"
+
+
+def _schedule_venue(match: wikipedia.MatchRow, opponent: str) -> str | None:
+    if match.neutral:
+        return match.venue
+    if match.home:
+        return GROUNDS["Manchester United"]
+    return GROUNDS.get(opponent)
+
+
+def derive_schedule(
+    matches: list[wikipedia.MatchRow],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """United's real season, split into played results and upcoming fixtures.
+
+    The season article publishes one table per competition and always writes
+    United's score first, whichever ground the match was played on, so each row
+    is re-oriented around the club that was actually at home. A filled-in score
+    means the match has been played; an empty one means it is still to come.
+    """
+    played: list[tuple[date, dict[str, Any]]] = []
+    upcoming: list[tuple[date, dict[str, Any]]] = []
+
+    for match in matches:
+        opponent = _canonical_team(match.opponent)
+        united_home = match.home
+        home, away = (
+            ("Manchester United", opponent) if united_home else (opponent, "Manchester United")
+        )
+        row: dict[str, Any] = {
+            "competition": match.competition,
+            "date": match.date.strftime("%d %b %Y").upper(),
+            "home": home,
+            "away": away,
+        }
+        venue = _schedule_venue(match, opponent)
+        if venue:
+            row["venue"] = venue
+        if match.round:
+            row["round"] = match.round
+        if not match.played:
+            row["status"] = "upcoming"
+            upcoming.append((match.date, row))
+            continue
+        row["status"] = "result"
+        row["homeScore"], row["awayScore"] = (
+            (match.united_goals, match.opponent_goals)
+            if united_home
+            else (match.opponent_goals, match.united_goals)
+        )
+        row["outcome"] = _UNITED_OUTCOME.get(match.outcome, "draw")
+        if match.scorers:
+            row["scorers"] = match.scorers
+        if match.attendance:
+            row["attendance"] = match.attendance
+        if match.position:
+            row["position"] = match.position
+        played.append((match.date, row))
+
+    played.sort(key=lambda pair: pair[0], reverse=True)
+    upcoming.sort(key=lambda pair: pair[0])
+
+    results = [row for _, row in played]
+    fixtures = [row for _, row in upcoming]
+    for index, row in enumerate(results, start=1):
+        row["id"] = 100 + index
+    for index, row in enumerate(fixtures, start=1):
+        row["id"] = 200 + index
+    return results, fixtures
+
+
 def _canonical_team(name: str) -> str:
     """Map a Wikipedia / publisher club name onto our canonical club name.
 
@@ -514,6 +638,24 @@ def derive_table(rows: list[wikipedia.StandingRow]) -> list[dict[str, Any]]:
             }
         )
     return table
+
+
+def _with_form(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Add each club's last five results, when ESPN has answered for them.
+
+    ESPN names clubs the way the league does, so both sides of the lookup go
+    through :func:`_canonical_team` before they meet. The form cache is only
+    read, never fetched: the column is a nicety, and 20 ESPN requests have no
+    business holding up a hub response.
+    """
+    form = form_service.cached_form()
+    if not rows or not form:
+        return rows
+    by_club = {_canonical_team(name): value for name, value in form.items()}
+    return [
+        {**row, "form": by_club.get(_canonical_team(str(row.get("team") or "")))}
+        for row in rows
+    ]
 
 
 def derive_standings(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -569,22 +711,53 @@ def _short_name(full: str) -> str:
     return f"{parts[0][0]}. {parts[-1]}"
 
 
+def _united_goals(results: list[dict[str, Any]]) -> tuple[int, int]:
+    """United's goals for and against across the matches we have."""
+    scored = conceded = 0
+    for row in results:
+        if not _has_united(row):
+            continue
+        united_home = row.get("home") == "Manchester United"
+        scored += row["homeScore"] if united_home else row["awayScore"]
+        conceded += row["awayScore"] if united_home else row["homeScore"]
+    return scored, conceded
+
+
+def _united_position(
+    results: list[dict[str, Any]], standings: list[dict[str, Any]]
+) -> str | None:
+    """United's league position, from the live table or the last match's cell."""
+    united_row = next((row for row in standings if row.get("isUnited")), None)
+    if united_row and isinstance(united_row.get("pos"), int):
+        return _ordinal(united_row["pos"])
+    return next((r["position"] for r in results if r.get("position")), None)
+
+
 def derive_overview(
-    items: list[dict[str, Any]],
     results: list[dict[str, Any]],
+    standings: list[dict[str, Any]],
     squad: list[wikipedia.SquadMember],
 ) -> dict[str, Any]:
-    """Real feed aggregates plus the club's actual top scorers."""
-    sources = {item.get("source") for item in items if item.get("source")}
-    united_matches = [r for r in results if _has_united(r)]
+    """United's season so far plus the club's actual top scorers."""
+    played = [r for r in results if _has_united(r)]
+    scored, conceded = _united_goals(played)
+    season = _season_label()
     stats = [
-        {"value": len(items), "label": "Stories Tracked", "sub": f"from {len(sources)} sources"},
         {
-            "value": len(results),
-            "label": "Results Parsed",
-            "sub": f"{len(united_matches)} involving United",
+            "value": len(played),
+            "label": "Matches Played",
+            "sub": f"{season} season" if season else "this season",
         },
-        {"value": len(_competition_names(results)), "label": "Competitions", "sub": "on the feed"},
+        {
+            "value": scored,
+            "label": "Goals Scored",
+            "sub": f"{conceded} conceded",
+        },
+        {
+            "value": _united_position(played, standings) or "—",
+            "label": "League Position",
+            "sub": "Premier League",
+        },
         {
             "value": len(squad),
             "label": "Squad Players",
@@ -601,10 +774,6 @@ def derive_overview(
         if member.goals > 0
     ][:5]
     return {"stats": stats, "top_scorers": scorers}
-
-
-def _competition_names(results: list[dict[str, Any]]) -> set[str]:
-    return {r.get("competition") for r in results if r.get("competition")}
 
 
 _POSITION_LABEL = {"GK": "Goalkeeper", "DF": "Defender", "MF": "Midfielder", "FW": "Forward"}
@@ -676,12 +845,13 @@ def derive_squad(squad: list[wikipedia.SquadMember]) -> list[dict[str, Any]]:
 
 
 def derive_hero(items: list[dict[str, Any]]) -> dict[str, Any]:
-    """Build the rotating hero pool for the hub banner.
+    """Build the United image pool the hub banner draws from.
 
     The banner used to be one hard-coded picture. Instead we offer every
     United-relevant article that carries an ``https`` image, ranked by the same
     relevance score the feed uses, so the biggest image on the page is always
-    about the club and always fresh. The client rotates through the pool.
+    about the club and always fresh. The client shows one entry per calendar
+    day, so the banner reads the same for every visitor.
     """
     scored: list[tuple[float, dict[str, Any]]] = []
     seen: set[str] = set()
@@ -712,7 +882,7 @@ def derive_hero(items: list[dict[str, Any]]) -> dict[str, Any]:
     slides = [row[1] for row in scored[:HERO_POOL_SIZE]]
     if not slides:
         return {}
-    return {"slides": slides, "interval_seconds": HERO_ROTATE_SECONDS}
+    return {"slides": slides}
 
 _NEWS_PROJECTION = {
     "_id": 0,
@@ -730,9 +900,8 @@ _NEWS_PROJECTION = {
     "status": 1,
 }
 
-# How many images make up the rotating hero pool, and how long each is shown.
+# How many United images make up the banner pool the client draws from.
 HERO_POOL_SIZE = 8
-HERO_ROTATE_SECONDS = 12
 
 
 def build_hub(database) -> dict[str, Any]:
@@ -758,25 +927,37 @@ def build_hub(database) -> dict[str, Any]:
         .limit(200)
     )
 
-    results = derive_results(items)
-    fixtures = derive_fixtures(items)
     # The hub is a Manchester United page: the fixtures and results panels show
-    # only United's matches. The standings come from Wikipedia's real league
-    # table; when that is unavailable we fall back to aggregating the parsed
-    # result set rather than showing nothing.
-    united_results = [row for row in results if _has_united(row)]
-    united_fixtures = [row for row in fixtures if _has_united(row)]
+    # only United's matches, taken from Wikipedia's season article. Parsing
+    # them out of news headlines is kept as a fallback, because headlines are
+    # unreliable - the same match turns up as both a result and a fixture, with
+    # the wrong competition - but it is never the first choice.
+    schedule_rows = wikipedia.fetch_matches()
+    schedule_meta: dict[str, Any] = {}
+    if schedule_rows:
+        united_results, united_fixtures = derive_schedule(schedule_rows)
+        standings_source = united_results
+        schedule_meta = dict(wikipedia.matches_meta())
+    else:
+        parsed_results = derive_results(items)
+        parsed_fixtures = derive_fixtures(items)
+        united_results = [row for row in parsed_results if _has_united(row)]
+        united_fixtures = [row for row in parsed_fixtures if _has_united(row)]
+        standings_source = parsed_results
+        schedule_meta = {"source": "Aggregated from the news feed", "updated_at": None}
+    schedule_meta["fixtures_total"] = len(united_fixtures)
+
     wikipedia_rows = wikipedia.fetch_standings()
     derived_standings = derive_table(wikipedia_rows)
     if derived_standings:
         standings = derived_standings
         standings_meta = wikipedia.standings_meta()
     else:
-        standings = derive_standings(results)
+        standings = derive_standings(standings_source)
         standings_meta = {}
     squad_members = wikipedia.fetch_squad()
     squad = derive_squad(squad_members)
-    overview = derive_overview(items, results, squad_members)
+    overview = derive_overview(united_results, standings, squad_members)
     compare = derive_compare(squad_members)
     hero = derive_hero(items)
 
@@ -807,6 +988,7 @@ def build_hub(database) -> dict[str, Any]:
         standings_meta = {"source": "SimplyUtd snapshot", "updated_at": None}
     elif not standings_meta and chosen_standings:
         standings_meta = {"source": "Aggregated from the news feed", "updated_at": None}
+    chosen_standings = _with_form(chosen_standings)
 
     return {
         "hero": pick("hero", hero),
@@ -815,6 +997,7 @@ def build_hub(database) -> dict[str, Any]:
         "results": pick("results", united_results),
         "standings": chosen_standings,
         "standings_meta": standings_meta,
+        "schedule_meta": schedule_meta,
         "compare": pick("compare", compare),
         "squad": pick("squad", squad, minimum=5),
     }
@@ -824,12 +1007,36 @@ def section(database, key: str) -> Any:
     return build_hub(database).get(key)
 
 
-async def hub_refresher() -> None:
-    """Keep the league table warm so a request never waits on Wikipedia.
+def revalidate() -> None:
+    """Refetch the season schedule and table off the request path when stale.
 
-    The table is the part of the hub that visibly goes stale, so it is polled
-    on ``HUB_REFRESH_SECONDS`` and written into the module cache with
-    ``force=True``. Requests then always read a fresh, already-computed table -
+    A visitor then always reads the cached payload, and the next request - the
+    poll that follows, or simply the next visit - paints the new result without
+    anyone waiting on Wikipedia. Guarded so a burst of panel reads triggers one
+    refresh, and it never raises: a failed read leaves the cached one in place
+    and is retried by the next visitor or the scheduled refresher.
+    """
+    global _revalidating
+    if _revalidating or not settings.hub_wikipedia_enabled:
+        return
+    if not wikipedia.schedule_stale():
+        return
+    _revalidating = True
+    try:
+        wikipedia.fetch_matches(force=True)
+        wikipedia.fetch_standings(force=True)
+    except Exception:  # noqa: BLE001 - a refresh must never break a response
+        logger.exception("Scheduled hub revalidation failed")
+    finally:
+        _revalidating = False
+
+
+async def hub_refresher() -> None:
+    """Keep the league table and fixture list warm so no request waits on Wikipedia.
+
+    These are the parts of the hub that visibly go stale, so they are polled on
+    ``HUB_REFRESH_SECONDS`` and written into the module caches with
+    ``force=True``. Requests then always read a fresh, already-computed payload -
     "assisted by the algorithm" rather than fetched on the critical path.
     """
     if not settings.hub_wikipedia_enabled:
@@ -839,6 +1046,16 @@ async def hub_refresher() -> None:
     interval = max(60, settings.hub_refresh_seconds)
     # Let startup (seed + index creation) settle first.
     await asyncio.sleep(5)
+    try:
+        # Nothing on the request path fetches form, so the first pass fills the
+        # cache the table's "Last 5" column reads; later passes only re-read it
+        # once its (much longer) interval has passed.
+        await asyncio.to_thread(form_service.fetch_form)
+        logger.info("Refreshed last-5 form (%d clubs)", len(form_service.cached_form()))
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - the loop must survive any failure
+        logger.exception("Scheduled form refresh failed")
     while True:
         try:
             rows = await asyncio.to_thread(wikipedia.fetch_standings, True)
@@ -847,6 +1064,19 @@ async def hub_refresher() -> None:
             raise
         except Exception:  # noqa: BLE001 - the loop must survive any failure
             logger.exception("Scheduled hub refresh failed")
+        try:
+            matches = await asyncio.to_thread(wikipedia.fetch_matches, True)
+            logger.info("Refreshed the season schedule (%d matches)", len(matches))
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - the loop must survive any failure
+            logger.exception("Scheduled hub refresh failed")
+        try:
+            await asyncio.to_thread(form_service.fetch_form)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - the loop must survive any failure
+            logger.exception("Scheduled form refresh failed")
         try:
             await asyncio.sleep(interval)
         except asyncio.CancelledError:

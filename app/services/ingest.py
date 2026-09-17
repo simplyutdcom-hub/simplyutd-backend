@@ -10,9 +10,9 @@ from pymongo.database import Database
 from .. import db as db_module
 from ..config import settings
 from ..utils import utcnow
-from . import cloudinary_service, feed_rank
+from . import classify, cloudinary_service, feed_rank, news_sources
 from .comment_service import seed_demo_comments
-from .excerpt import enrich
+from .excerpt import backfill_images, enrich
 from .news_service import prune_external, upsert_entry
 from .rss import collect_entries
 
@@ -31,7 +31,7 @@ def run_ingest(database: Database, *, mirror_images: bool | None = None) -> dict
     mirror = settings.ingest_mirror_images if mirror_images is None else mirror_images
     mirror_available = mirror and cloudinary_service.is_configured()
 
-    entries = collect_entries()
+    entries = collect_entries(feeds=news_sources.enabled_urls(database), include_google_news=False)
     try:
         enriched = enrich(entries)
     except Exception:  # noqa: BLE001 - previews are a nice-to-have
@@ -40,10 +40,12 @@ def run_ingest(database: Database, *, mirror_images: bool | None = None) -> dict
     inserted = 0
     skipped = 0
     mirrored = 0
+    mirror_attempts = 0
 
     for entry in entries:
         image_url = entry.image
         if mirror_available and image_url:
+            mirror_attempts += 1
             stored = cloudinary_service.upload_remote(image_url, folder="news")
             if stored:
                 image_url = stored
@@ -63,6 +65,14 @@ def run_ingest(database: Database, *, mirror_images: bool | None = None) -> dict
     except Exception:  # noqa: BLE001
         logger.debug("Prune failed", exc_info=True)
 
+    # Feed items that shipped no image (Google News never does) are re-checked
+    # against their publisher's link preview, a few per run.
+    backfilled = 0
+    try:
+        backfilled = backfill_images(database)
+    except Exception:  # noqa: BLE001
+        logger.debug("Image backfill failed", exc_info=True)
+
     # Keep the whole corpus scored: anything stored before the ranking algorithm
     # existed (or edited by hand since) gets its United verdict filled in here so
     # the feed never has to fall back to a plain date sort.
@@ -72,15 +82,29 @@ def run_ingest(database: Database, *, mirror_images: bool | None = None) -> dict
     except Exception:  # noqa: BLE001
         logger.debug("Ranking backfill failed", exc_info=True)
 
+    # Articles ingested before the section classifier existed still carry the
+    # generic label; filing them here keeps the "all stories" page meaningful
+    # without the feed having to re-download anything.
+    classified = 0
+    try:
+        classified = classify.backfill(database)
+    except Exception:  # noqa: BLE001
+        logger.debug("Category backfill failed", exc_info=True)
+
     summary = {
         "started_at": started,
         "finished_at": utcnow(),
         "interval_minutes": settings.ingest_interval_minutes,
+        "sources": news_sources.count_enabled(database),
         "fetched": len(entries),
         "enriched": enriched,
+        "backfilled_images": backfilled,
+        "classified": classified,
         "inserted": inserted,
         "skipped": skipped,
         "mirrored_images": mirrored,
+        "mirror_attempts": mirror_attempts,
+        "mirror_error": cloudinary_service.last_error(),
         "pruned": pruned,
         "scored": scored,
         "status": "ok",

@@ -16,6 +16,7 @@ from pymongo.database import Database
 from .. import db as db_module
 from ..utils import new_id, slugify, utcnow
 from .comment_service import seed_demo_comments
+from .news_sources import seed_defaults as seed_news_sources
 
 logger = logging.getLogger("simplyutd.seed")
 
@@ -105,10 +106,10 @@ PLAYER_IMAGES: dict[str, str] = {
 HUB_SECTIONS: dict[str, Any] = {
     "overview": {
         "stats": [
-            {"value": 30, "label": "Squad Players", "sub": "current season"},
-            {"value": 20, "label": "League Clubs", "sub": "Premier League"},
-            {"value": 5, "label": "United Fixtures", "sub": "upcoming"},
-            {"value": 5, "label": "Top Scorers", "sub": "on the scoresheet"},
+            {"value": 5, "label": "Matches Played", "sub": "2026/27 season"},
+            {"value": 11, "label": "Goals Scored", "sub": "7 conceded"},
+            {"value": "13th", "label": "League Position", "sub": "Premier League"},
+            {"value": 30, "label": "Squad Players", "sub": "2026/27 season"},
         ],
         "top_scorers": [
             {"name": "B. Fernandes", "goals": 4, "apps": 5},
@@ -119,17 +120,18 @@ HUB_SECTIONS: dict[str, Any] = {
         ],
     },
     "fixtures": [
-        {"id": 1, "competition": "Premier League", "date": "20 SEP 2026 • 15:00", "home": "Manchester United", "away": "Arsenal", "status": "upcoming", "venue": "Old Trafford"},
-        {"id": 2, "competition": "Carabao Cup", "date": "24 SEP 2026 • 20:00", "home": "Brighton", "away": "Manchester United", "status": "upcoming", "venue": "Amex Stadium"},
-        {"id": 3, "competition": "Premier League", "date": "27 SEP 2026 • 16:30", "home": "Manchester United", "away": "Chelsea", "status": "upcoming", "venue": "Old Trafford"},
-        {"id": 4, "competition": "Europa League", "date": "2 OCT 2026 • 20:00", "home": "Lyon", "away": "Manchester United", "status": "upcoming", "venue": "Groupama Stadium"},
-        {"id": 5, "competition": "Premier League", "date": "5 OCT 2026 • 15:00", "home": "Manchester United", "away": "Newcastle", "status": "upcoming", "venue": "Old Trafford"},
+        {"id": 201, "competition": "Carabao Cup", "date": "16 SEP 2026", "home": "Manchester United", "away": "Brighton", "status": "upcoming", "venue": "Old Trafford", "round": "Third round"},
+        {"id": 202, "competition": "Premier League", "date": "20 SEP 2026", "home": "Fulham", "away": "Manchester United", "status": "upcoming", "venue": "Craven Cottage"},
+        {"id": 203, "competition": "Premier League", "date": "10 OCT 2026", "home": "Manchester United", "away": "Tottenham", "status": "upcoming", "venue": "Old Trafford"},
+        {"id": 204, "competition": "Champions League", "date": "13 OCT 2026", "home": "Atlético Madrid", "away": "Manchester United", "status": "upcoming"},
+        {"id": 205, "competition": "Premier League", "date": "17 OCT 2026", "home": "Chelsea", "away": "Manchester United", "status": "upcoming", "venue": "Stamford Bridge"},
     ],
     "results": [
-        {"id": 11, "competition": "Premier League", "date": "30 AUG 2026", "home": "Manchester United", "away": "Tottenham", "homeScore": 2, "awayScore": 0, "status": "result"},
-        {"id": 12, "competition": "Premier League", "date": "23 AUG 2026", "home": "Liverpool", "away": "Manchester United", "homeScore": 1, "awayScore": 1, "status": "result"},
-        {"id": 13, "competition": "Premier League", "date": "16 AUG 2026", "home": "Manchester United", "away": "Fulham", "homeScore": 3, "awayScore": 1, "status": "result"},
-        {"id": 14, "competition": "Community Shield", "date": "10 AUG 2026", "home": "Manchester City", "away": "Manchester United", "homeScore": 0, "awayScore": 1, "status": "result"},
+        {"id": 101, "competition": "Premier League", "date": "13 SEP 2026", "home": "Manchester United", "away": "Manchester City", "homeScore": 0, "awayScore": 1, "outcome": "loss", "position": "13th", "attendance": "74,161", "status": "result"},
+        {"id": 102, "competition": "Champions League", "date": "10 SEP 2026", "home": "Manchester United", "away": "Sabah", "homeScore": 4, "awayScore": 0, "outcome": "win", "position": "4th", "attendance": "73,685", "status": "result"},
+        {"id": 103, "competition": "Premier League", "date": "06 SEP 2026", "home": "Everton", "away": "Manchester United", "homeScore": 2, "awayScore": 2, "outcome": "draw", "position": "11th", "attendance": "52,302", "status": "result"},
+        {"id": 104, "competition": "Premier League", "date": "30 AUG 2026", "home": "Manchester United", "away": "Ipswich", "homeScore": 5, "awayScore": 2, "outcome": "win", "position": "10th", "attendance": "74,148", "status": "result"},
+        {"id": 105, "competition": "Premier League", "date": "22 AUG 2026", "home": "Hull", "away": "Manchester United", "homeScore": 2, "awayScore": 0, "outcome": "loss", "position": "17th", "attendance": "24,470", "status": "result"},
     ],
     "standings": [
         {"pos": 1, "team": "Manchester City", "played": 5, "won": 4, "drawn": 1, "lost": 0, "gf": 10, "ga": 4, "pts": 13},
@@ -347,6 +349,11 @@ def seed_all(database: Database) -> dict[str, int]:
         "products": _seed_products(database),
         "news": _seed_news(database),
     }
+    try:
+        summary["news_sources"] = seed_news_sources(database)
+    except Exception:  # noqa: BLE001 - ingestion falls back to configured feeds
+        logger.debug("News source seeding skipped", exc_info=True)
+        summary["news_sources"] = 0
     try:
         summary["comments"] = seed_demo_comments(database)
     except Exception:  # noqa: BLE001 - demo chatter must never block startup

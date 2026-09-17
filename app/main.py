@@ -25,6 +25,7 @@ from .routers import (
     newsletter,
     search,
     store,
+    x,
 )
 from .services.ingest import scheduler
 from .services.seed import seed_all
@@ -110,6 +111,7 @@ for module in (
     auth,
     search,
     admin,
+    x,
 ):
     app.include_router(module.router)
 

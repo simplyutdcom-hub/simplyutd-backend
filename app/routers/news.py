@@ -19,6 +19,7 @@ def list_news(
     q: str | None = None,
     limit: int = Query(20, ge=1, le=100),
     skip: int = Query(0, ge=0),
+    min_items: int = Query(8, ge=1, le=50),
     database: Database = Depends(get_db),
 ) -> ListResponse:
     items, total = news_service.list_news(
@@ -30,6 +31,7 @@ def list_news(
         q=q,
         limit=limit,
         skip=skip,
+        min_items=min_items,
     )
     return ListResponse(items=items, total=total, limit=limit, skip=skip)
 
@@ -37,6 +39,12 @@ def list_news(
 @router.get("/ticker")
 def ticker(limit: int = Query(6, ge=1, le=20), database: Database = Depends(get_db)) -> dict:
     return {"items": news_service.ticker(database, limit)}
+
+
+@router.get("/categories")
+def categories(database: Database = Depends(get_db)) -> dict:
+    """Section names and how many club-relevant stories each holds."""
+    return news_service.category_counts(database)
 
 
 @router.get("/{news_id}")

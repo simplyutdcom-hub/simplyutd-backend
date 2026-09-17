@@ -236,6 +236,30 @@ class AnalyticsResponse(ORMModel):
     ok: bool = True
 
 
+# --- News sources (RSS ingestion) ------------------------------------------
+class NewsSourceBase(ORMModel):
+    name: str = Field(min_length=1, max_length=120)
+    url: str = Field(min_length=8, max_length=500)
+    enabled: bool = True
+
+
+class NewsSourceCreate(NewsSourceBase):
+    pass
+
+
+class NewsSourceUpdate(ORMModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    url: str | None = Field(default=None, min_length=8, max_length=500)
+    enabled: bool | None = None
+
+
+class NewsSourceOut(NewsSourceBase):
+    id: str
+    builtin: bool = False
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
 # --- Generic ---------------------------------------------------------------
 class ListResponse(ORMModel):
     items: list[Any]

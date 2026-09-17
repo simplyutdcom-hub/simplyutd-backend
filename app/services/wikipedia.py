@@ -1,8 +1,12 @@
-"""Real Manchester United squad, season stats and league table from Wikipedia.
+"""Real Manchester United squad, season stats, schedule and table from Wikipedia.
 
-The hub's "United players", "Player comparison" and "Premier League table"
-panels used to show fabricated numbers. This module replaces them with:
+The hub's "United players", "Player comparison", "Premier League table" and
+fixtures/results panels used to show fabricated or headline-derived numbers.
+This module replaces them with:
 
+* the club's actual season schedule (dates, opponents, venues, scorelines,
+  scorers, attendances) from the ``wikitable`` match tables on the current
+  season article,
 * the club's actual squad list (numbers, positions, names) and per-player
   season record (appearances, goals, cards) from the ``Squad statistics``
   table on the current season article, and
@@ -18,8 +22,8 @@ panels used to show fabricated numbers. This module replaces them with:
 Wikipedia's content is CC BY-SA. We only surface factual data (numbers,
 positions, names, appearance/goal/points counts) - no prose is republished -
 and the squad is cached so we hit the API at most once per
-``hub_cache_seconds``. The table is cached more briefly
-(``hub_standings_cache_seconds``) and refreshed in the background.
+``hub_cache_seconds``. The table and the schedule are cached more briefly
+(``hub_standings_cache_seconds``) and the table is refreshed in the background.
 """
 
 from __future__ import annotations
@@ -28,7 +32,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from html.parser import HTMLParser
 from typing import Any
 
@@ -558,6 +562,348 @@ def parse_standings_html(markup: str) -> list[StandingRow]:
     return []
 
 
+# --------------------------------------------------------------------------- #
+# Season fixtures and results
+# --------------------------------------------------------------------------- #
+#
+# The hub's fixtures/results panels used to be parsed out of news headlines,
+# which produced contradictions (the same opponent as both a played result and
+# an upcoming fixture) and missed matches entirely. Wikipedia's season article
+# carries the authoritative schedule as ``wikitable`` match tables, one per
+# competition, so that is what we read.
+
+# Level-2 section heading -> the competition name the hub shows. Anything not
+# listed here (pre-season friendlies, transfers, awards) is ignored.
+_COMPETITION_SECTIONS: tuple[tuple[str, str], ...] = (
+    ("premier league", "Premier League"),
+    ("carabao cup", "Carabao Cup"),
+    ("efl cup", "Carabao Cup"),
+    ("league cup", "Carabao Cup"),
+    ("fa cup", "FA Cup"),
+    ("champions league", "Champions League"),
+    ("europa league", "Europa League"),
+    ("conference league", "Conference League"),
+    ("community shield", "Community Shield"),
+)
+
+# ``18 July 2026`` / ``12 August 2026`` - also accepts a ``18–19 August`` range,
+# in which case the first day is used.
+_MATCH_DATE_RE = re.compile(
+    r"(\d{1,2})(?:\s*[\u2013\u2014-]\s*\d{1,2})?\s+([A-Za-z]{3,9})\.?\s+(\d{4})"
+)
+_MONTHS = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
+
+# ``[https://example.com/report-united-0-wrexham-1 0–1]`` - the display text is
+# the score, so it must replace the whole link before a score is looked for.
+# (The URL itself can contain digit-dash-digit spans that look like scorelines.)
+_EXTLINK_RE = re.compile(r"\[(https?://[^\s\]]+)(?:\s+([^\]]*))?\]")
+_NEUTRAL_SIDE = {"n", "neutral"}
+
+
+@dataclass
+class MatchRow:
+    """One fixture or result from the club's season article."""
+
+    competition: str
+    date: date
+    opponent: str
+    home: bool = False
+    neutral: bool = False
+    united_goals: int | None = None
+    opponent_goals: int | None = None
+    venue: str | None = None
+    round: str | None = None
+    scorers: str | None = None
+    attendance: str | None = None
+    position: str | None = None
+
+    @property
+    def played(self) -> bool:
+        """A filled-in scoreline means the match has been played."""
+        return self.united_goals is not None and self.opponent_goals is not None
+
+    @property
+    def outcome(self) -> str | None:
+        """``W``/``D``/``L`` from United's point of view, for played matches."""
+        if not self.played:
+            return None
+        if self.united_goals > self.opponent_goals:
+            return "W"
+        if self.united_goals < self.opponent_goals:
+            return "L"
+        return "D"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "competition": self.competition,
+            "date": self.date.isoformat(),
+            "opponent": self.opponent,
+            "home": self.home,
+            "neutral": self.neutral,
+            "united_goals": self.united_goals,
+            "opponent_goals": self.opponent_goals,
+            "venue": self.venue,
+            "round": self.round,
+            "scorers": self.scorers,
+            "attendance": self.attendance,
+            "position": self.position,
+        }
+
+
+def _plain(raw: str) -> str:
+    """Wikitext cell -> readable plain text, keeping bracketed detail intact.
+
+    Unlike :func:`_clean_name` this keeps parenthetical content, because the
+    scorers cell uses it (``Fernandes (3) 40' (pen.)``).
+    """
+    text = _COMMENT_RE.sub("", raw)
+    text = _REF_RE.sub("", text)
+    text = _FLAG_RE.sub("", text)
+    text = _EXTLINK_RE.sub(lambda m: m.group(2) or "", text)
+    text = _LINK_RE.sub(lambda m: m.group(2) or m.group(1), text)
+    text = re.sub(r"<br\s*/?>", " ", text, flags=re.IGNORECASE)
+    text = _TAG_RE.sub("", text)
+    text = text.replace("'''", "").replace("''", "")
+    return re.sub(r"\s+", " ", text).strip(" ,\u00a0|")
+
+
+def _split_cells(line: str, separator: str = "||") -> list[str]:
+    """Split a table row on ``||`` (or ``!!``), ignoring pipes inside links."""
+    cells: list[str] = []
+    buffer: list[str] = []
+    depth = 0
+    index = 0
+    while index < len(line):
+        if line.startswith("[[", index):
+            depth += 1
+            buffer.append("[[")
+            index += 2
+        elif line.startswith("]]", index) and depth:
+            depth -= 1
+            buffer.append("]]")
+            index += 2
+        elif depth == 0 and line.startswith(separator, index):
+            cells.append("".join(buffer))
+            buffer = []
+            index += len(separator)
+        else:
+            buffer.append(line[index])
+            index += 1
+    cells.append("".join(buffer))
+    return cells
+
+
+def _strip_attrs(cell: str) -> str:
+    """``align="left"|[[Bruno Fernandes]]`` -> ``[[Bruno Fernandes]]``."""
+    while True:
+        head, separator, tail = cell.partition("|")
+        if not separator or "=" not in head or "[" in head:
+            return cell
+        cell = tail
+
+
+def _heading_label(line: str) -> tuple[int, str]:
+    """``====League phase====`` -> ``(4, 'League phase')``."""
+    level = len(line) - len(line.lstrip("="))
+    label = _plain(line.strip("=")).strip()
+    return level, label
+
+
+def _competition_for(heading: str) -> str | None:
+    lowered = heading.lower()
+    for needle, competition in _COMPETITION_SECTIONS:
+        if needle in lowered:
+            return competition
+    return None
+
+
+def _match_columns(header: list[str]) -> dict[str, int] | None:
+    """Locate the columns we care about, or ``None`` if this is not a match table."""
+    columns: dict[str, int] = {}
+
+    def put(key: str, position: int) -> None:
+        columns.setdefault(key, position)
+
+    for position, raw in enumerate(header):
+        label = _plain(raw).lower()
+        if not label:
+            continue
+        if "date" in label:
+            put("date", position)
+        elif "opponent" in label:
+            put("opponent", position)
+        elif label.startswith("h") and "/" in label:
+            put("side", position)
+        elif "scorer" in label:
+            # Checked before the score/result column: "scorers" contains "score".
+            put("scorers", position)
+        elif "result" in label or "score" in label:
+            put("result", position)
+        elif "attendance" in label:
+            put("attendance", position)
+        elif "position" in label:
+            put("position", position)
+        elif "round" in label:
+            put("round", position)
+
+    if "date" not in columns or "opponent" not in columns:
+        return None
+    return columns
+
+
+def _match_date(raw: str) -> date | None:
+    match = _MATCH_DATE_RE.search(_plain(raw))
+    if not match:
+        return None
+    month = _MONTHS.get(match.group(2)[:3].lower())
+    if not month:
+        return None
+    try:
+        return date(int(match.group(3)), month, int(match.group(1)))
+    except ValueError:
+        return None
+
+
+def _match_side(raw: str) -> tuple[bool, bool, str | None]:
+    """``H`` / ``A`` / ``[[Helsinki Olympic Stadium|N]]`` -> home, neutral, venue."""
+    venue: str | None = None
+    link = _LINK_RE.search(raw)
+    if link:
+        display = (link.group(2) or link.group(1)).strip().lower()
+        if display in _NEUTRAL_SIDE:
+            venue = _COMMENT_RE.sub("", link.group(1)).replace("_", " ").strip()
+    text = _plain(raw).strip().lower()
+    if text in {"h", "home"}:
+        return True, False, None
+    if text in {"a", "away"}:
+        return False, False, None
+    if text in _NEUTRAL_SIDE:
+        # Neutral venues: the club is listed second, but the scoreline stays
+        # United-first either way, so the caller keeps them aligned.
+        return False, True, venue
+    return False, False, None
+
+
+def _match_score(raw: str) -> tuple[int, int] | None:
+    """``0–2`` -> ``(0, 2)``; an empty (unplayed) cell -> ``None``."""
+    match = _SCORE_RE.search(_plain(raw))
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _match_row(cells: list[str], columns: dict[str, int], competition: str) -> MatchRow | None:
+    def cell(key: str) -> str:
+        position = columns.get(key)
+        if position is None or position >= len(cells):
+            return ""
+        return cells[position]
+
+    played_on = _match_date(cell("date"))
+    opponent = _team_display(cell("opponent"))
+    if played_on is None or not opponent:
+        return None
+    home, neutral, venue = _match_side(cell("side"))
+    score = _match_score(cell("result"))
+    return MatchRow(
+        competition=competition,
+        date=played_on,
+        opponent=opponent,
+        home=home,
+        neutral=neutral,
+        united_goals=score[0] if score else None,
+        opponent_goals=score[1] if score else None,
+        venue=venue,
+        round=_plain(cell("round")) or None,
+        scorers=_plain(cell("scorers")) or None,
+        attendance=_plain(cell("attendance")) or None,
+        position=_plain(cell("position")) or None,
+    )
+
+
+def _parse_match_table(table: list[str], heading: str) -> list[MatchRow]:
+    """Read one ``wikitable`` body into match rows (empty when it is not one)."""
+    competition = _competition_for(heading)
+    if not competition:
+        return []
+
+    header: list[str] = []
+    body: list[list[str]] = []
+    for line in table:
+        if line.startswith("!"):
+            header.extend(_strip_attrs(part) for part in _split_cells(line[1:], "!!"))
+        elif line.startswith("|-"):
+            body.append([])
+        elif line.startswith("|"):
+            if not body:
+                body.append([])
+            body[-1].extend(_strip_attrs(part) for part in _split_cells(line[1:]))
+
+    columns = _match_columns(header)
+    if columns is None:
+        return []
+
+    rows: list[MatchRow] = []
+    for cells in body:
+        row = _match_row(cells, columns, competition)
+        if row is not None:
+            rows.append(row)
+    return rows
+
+
+def parse_matches(wikitext: str) -> list[MatchRow]:
+    """Every scheduled match on the club's season article, in page order.
+
+    Tables are located by their header cells rather than by offset, so a new
+    competition block (or a re-ordered article) is picked up automatically. The
+    competition comes from the enclosing level-2 heading, which is what keeps
+    pre-season friendlies out of the season record.
+    """
+    rows: list[MatchRow] = []
+    section = ""
+    table: list[str] | None = None
+    depth = 0
+
+    for raw in wikitext.splitlines():
+        line = raw.strip()
+        if depth == 0:
+            if line.startswith("==") and line.endswith("=") and not line.startswith("{{"):
+                level, label = _heading_label(line)
+                if level == 2:
+                    section = label
+                continue
+            if line.startswith("{|"):
+                table = []
+                depth = 1
+            continue
+
+        if line.startswith("{|"):
+            depth += 1
+            table.append(line)  # type: ignore[union-attr]
+        elif line.startswith("|}"):
+            depth -= 1
+            if depth == 0:
+                rows.extend(_parse_match_table(table or [], section))
+                table = None
+        else:
+            table.append(line)  # type: ignore[union-attr]
+
+    return rows
+
+
 def _fetch_wikitext(page: str) -> str | None:
     try:
         response = httpx.get(
@@ -700,11 +1046,71 @@ def fetch_standings(force: bool = False) -> list[StandingRow]:
     return rows
 
 
+class _MatchesCache:
+    value: list[MatchRow] | None = None
+    expires: float = 0.0
+    fetched_at: float | None = None
+
+
+_matches_cache = _MatchesCache()
+
+
+def matches_meta() -> dict[str, Any]:
+    """When the schedule was last refreshed and from where (for the UI caption)."""
+    if _matches_cache.fetched_at is None:
+        return {}
+    return {
+        "source": "Wikipedia season article",
+        "updated_at": datetime.fromtimestamp(
+            _matches_cache.fetched_at, tz=timezone.utc
+        ).isoformat(),
+    }
+
+
+def schedule_stale() -> bool:
+    """True when a cached schedule has outlived its interval.
+
+    A read still serves that cached list; this only says a refresh is worth
+    starting off the request path. False before the first read, because that
+    read has to fetch anyway.
+    """
+    return _matches_cache.value is not None and time.monotonic() >= _matches_cache.expires
+
+
+def fetch_matches(force: bool = False) -> list[MatchRow]:
+    """United's real season schedule, cached for ``hub_standings_cache_seconds``.
+
+    A new result lands on Wikipedia within minutes of full time, so the
+    schedule is cached on the same short interval as the table. As with the
+    other fetchers, only a successful read is cached and an empty list (never an
+    exception) is returned when Wikipedia is disabled or unreachable.
+    """
+    if not settings.hub_wikipedia_enabled:
+        return []
+    now = time.monotonic()
+    if not force and _matches_cache.value is not None and now < _matches_cache.expires:
+        return _matches_cache.value
+
+    rows: list[MatchRow] = []
+    wikitext = _fetch_wikitext(settings.hub_season_page)
+    if wikitext:
+        rows = parse_matches(wikitext)
+
+    if rows:
+        _matches_cache.value = rows
+        _matches_cache.expires = now + settings.hub_standings_cache_seconds
+        _matches_cache.fetched_at = time.time()
+    return rows
+
+
 def reset_cache() -> None:
-    """Clear the cached squad and table (used by tests)."""
+    """Clear the cached squad, table and schedule (used by tests)."""
     _cache.value = None
     _cache.expires = 0.0
     _standings_cache.value = None
     _standings_cache.expires = 0.0
     _standings_cache.fetched_at = None
     _standings_cache.source = None
+    _matches_cache.value = None
+    _matches_cache.expires = 0.0
+    _matches_cache.fetched_at = None

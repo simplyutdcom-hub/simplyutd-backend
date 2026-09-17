@@ -16,12 +16,14 @@ from __future__ import annotations
 import logging
 import re
 from html import unescape
+from typing import Any
 from urllib.parse import urljoin
 
 import httpx
 
+from .. import db as db_module
 from ..config import settings
-from ..utils import strip_html
+from ..utils import strip_html, utcnow
 
 logger = logging.getLogger("simplyutd.excerpt")
 
@@ -30,6 +32,11 @@ logger = logging.getLogger("simplyutd.excerpt")
 _MAX_HTML = 300_000
 _META_KEYS = ("og:description", "twitter:description", "description")
 _IMAGE_KEYS = ("og:image", "twitter:image")
+
+# Stamped on a stored story every time its link preview is read, and counted so
+# a publisher that never exposes a preview is only retried a few times.
+IMAGE_CHECKED = "image_checked_at"
+IMAGE_ATTEMPTS = "image_attempts"
 
 _TAG_RE = re.compile(r"<meta\s+([^>]+?)/?>", re.IGNORECASE)
 _ATTR_RE = re.compile(r"([a-zA-Z:_.-]+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)')")
@@ -90,12 +97,67 @@ def fetch_preview(url: str, *, timeout: float | None = None) -> dict[str, str | 
     return {"description": description or None, "image": image}
 
 
+def backfill_images(database: Any, *, cap: int | None = None) -> int:
+    """Give stored external stories the thumbnail they were first ingested without.
+
+    Google News items carry no image of their own, so this re-reads the
+    publisher's link-preview metadata for stories already in the database. A
+    publisher whose preview is missing on the first read may still publish one
+    later, so every read is counted in ``IMAGE_ATTEMPTS`` and the story is
+    retried on later runs until ``NEWS_IMAGE_ATTEMPTS`` is reached — after that
+    the frontend's placeholder stands in. The per-run cap keeps the work
+    bounded. Returns the number of stories given an image.
+    """
+    if not settings.news_fetch_excerpts:
+        return 0
+
+    budget = settings.news_backfill_max if cap is None else cap
+    if budget <= 0:
+        return 0
+
+    attempts = max(1, settings.news_image_attempts)
+    collection = database[db_module.NEWS]
+    pending = {
+        "external": True,
+        "$or": [{"image": None}, {"image": ""}],
+        "$and": [
+            {
+                "$or": [
+                    {IMAGE_ATTEMPTS: {"$exists": False}},
+                    {IMAGE_ATTEMPTS: {"$lt": attempts}},
+                ]
+            }
+        ],
+    }
+    updated = 0
+    for doc in collection.find(pending, {"source_url": 1, IMAGE_ATTEMPTS: 1}).limit(budget):
+        preview = fetch_preview(doc.get("source_url") or "")
+        fields: dict[str, Any] = {IMAGE_CHECKED: utcnow()}
+        if preview["image"]:
+            fields["image"] = preview["image"]
+            fields["updated_at"] = utcnow()
+            updated += 1
+        try:
+            collection.update_one(
+                {"_id": doc["_id"]},
+                {"$set": fields, "$inc": {IMAGE_ATTEMPTS: 1}},
+            )
+        except Exception:  # noqa: BLE001 - a write failure must not stop ingestion
+            logger.debug("Could not backfill image for %s", doc.get("source_url"))
+
+    if updated:
+        logger.info("Backfilled %d story images from link previews", updated)
+    return updated
+
+
 def enrich(entries: list, *, cap: int | None = None) -> int:
     """Fill in missing summaries/images from link-preview metadata in place.
 
-    Only entries whose summary is shorter than ``NEWS_EXCERPT_MIN_SUMMARY`` are
-    touched, and at most ``cap`` (default ``NEWS_EXCERPT_MAX``) lookups happen per
-    run. Returns the number of entries updated.
+    An entry is looked up when its summary is shorter than
+    ``NEWS_EXCERPT_MIN_SUMMARY`` **or** it carries no image, so a feed that ships
+    a usable summary but no thumbnail still ends up with a picture. At most
+    ``cap`` (default ``NEWS_EXCERPT_MAX``) lookups happen per run. Returns the
+    number of entries updated.
     """
     if not settings.news_fetch_excerpts:
         return 0
@@ -108,11 +170,14 @@ def enrich(entries: list, *, cap: int | None = None) -> int:
     for entry in entries:
         if budget <= 0:
             break
-        if len(entry.summary or "") >= settings.news_excerpt_min_summary:
+        short_summary = len(entry.summary or "") < settings.news_excerpt_min_summary
+        if not short_summary and entry.image:
             continue
         budget -= 1
         preview = fetch_preview(entry.link)
-        if preview["description"]:
+        # A story that already carries a proper summary keeps it; only the
+        # thumbnail is filled in for those.
+        if preview["description"] and short_summary:
             entry.summary = preview["description"]
         if preview["image"] and not entry.image:
             entry.image = preview["image"]

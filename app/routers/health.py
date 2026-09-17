@@ -42,6 +42,9 @@ def diagnostics(database: Database = Depends(get_db)) -> dict:
         "cloudinary": {
             "configured": cloudinary_service.is_configured(),
             "folder": settings.cloudinary_folder,
+            # A configured account that still mirrors nothing is the interesting
+            # case: this says why the last upload was refused.
+            "last_error": cloudinary_service.last_error(),
         },
         "email": {
             "configured": mailer.is_configured(),

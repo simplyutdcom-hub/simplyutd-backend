@@ -19,9 +19,31 @@ logger = logging.getLogger("simplyutd.cloudinary")
 
 _configured = False
 
+#: Short description of the most recent mirror failure, or ``None``. Mirrors are
+#: best-effort, but a silent 0% success rate hides a misconfigured account, so
+#: the reason is kept here and reported by ``/api/diag`` and the ingest summary.
+_last_error: str | None = None
+
 
 def is_configured() -> bool:
     return settings.cloudinary_configured
+
+
+def last_error() -> str | None:
+    """Why the last mirror attempt failed, if it did."""
+    return _last_error
+
+
+def _record_error(exc: BaseException) -> None:
+    global _last_error
+    message = str(exc).strip().replace("\n", " ")
+    _last_error = f"{type(exc).__name__}: {message}"[:240] or type(exc).__name__
+
+
+def _clear_error() -> None:
+    """Reset the reported failure so it always describes the latest attempt."""
+    global _last_error
+    _last_error = None
 
 
 def _ensure_config() -> bool:
@@ -62,7 +84,8 @@ def upload_bytes(
             tags=tags,
             overwrite=False,
         )
-    except Exception:  # noqa: BLE001 - never let storage break a request
+    except Exception as exc:  # noqa: BLE001 - never let storage break a request
+        _record_error(exc)
         logger.exception("Cloudinary upload failed (folder=%s)", target_folder)
         return None
 
@@ -88,7 +111,8 @@ def upload_fileobj(
             tags=tags,
             overwrite=False,
         )
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        _record_error(exc)
         logger.exception("Cloudinary file upload failed (folder=%s)", target_folder)
         return None
 
@@ -114,9 +138,15 @@ def upload_remote(
             resource_type="image",
             overwrite=False,
         )
+        _clear_error()
         return result.get("secure_url") or result.get("url")
-    except Exception:  # noqa: BLE001 - remote hot-link may be blocked
-        logger.info("Cloudinary remote mirror failed for %s", url)
+    except Exception as exc:  # noqa: BLE001 - remote hot-link may be blocked
+        # Publishers that block hot-linking, an unverified account, or a wrong
+        # API secret all land here; without the traceback there is no way to
+        # tell them apart from the logs.
+        _record_error(exc)
+        logger.warning("Cloudinary remote mirror failed for %s: %s", url, exc)
+        logger.debug("Cloudinary remote mirror traceback", exc_info=True)
         return None
 
 

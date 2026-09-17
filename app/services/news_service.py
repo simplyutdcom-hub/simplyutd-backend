@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -12,7 +13,7 @@ from pymongo.errors import DuplicateKeyError
 from .. import db as db_module
 from ..schemas import NewsCreate, NewsUpdate
 from ..utils import new_id, serialize, serialize_many, slugify, utcnow
-from . import feed_rank
+from . import classify, feed_rank
 from .rss import FeedEntry
 
 logger = logging.getLogger("simplyutd.news")
@@ -40,12 +41,17 @@ def list_news(
     skip: int = 0,
     sort: str = "published_at",
     united_only: bool = True,
+    min_items: int = 8,
 ) -> tuple[list[dict[str, Any]], int]:
     """List articles.
 
     The public surfaces are United-only and ordered by the relevance algorithm
     in :mod:`app.services.feed_rank`; admin listings pass ``united_only=False``
     to see the raw corpus in plain chronological order.
+
+    ``min_items`` is the size the club-gated pool must reach before the ranking
+    falls back to the unfiltered one. Callers behind a section filter pass a low
+    value so a thin section never has to pad itself with rival-club stories.
     """
     if united_only:
         items, total = feed_rank.fetch(
@@ -57,6 +63,7 @@ def list_news(
             source=source,
             featured=featured,
             status=status or "Published",
+            min_items=max(1, min_items),
         )
         return serialize_many(items), total
 
@@ -231,6 +238,34 @@ def ranked(database: Database, *, limit: int = 12, skip: int = 0) -> list[dict[s
     """A page of the United-first feed, used by the home page slices."""
     docs, _ = feed_rank.fetch(database, limit=limit, skip=skip, min_items=1)
     return serialize_many(docs)
+
+
+def category_counts(database: Database, *, pool_size: int = 1000) -> dict[str, Any]:
+    """How many club-relevant stories sit in each section.
+
+    Counted over the gated corpus (never the raw one) so the numbers on the
+    section tabs match the lists the tabs actually open. Sections are returned
+    in descending size, with the generic "News" bucket always last.
+    """
+    docs, _ = feed_rank.fetch(
+        database,
+        limit=max(1, pool_size),
+        min_items=1,
+        max_per_source=max(1, pool_size),
+    )
+
+    counts: Counter[str] = Counter()
+    for doc in docs:
+        counts[str(doc.get("category") or classify.DEFAULT_CATEGORY)] += 1
+
+    names = sorted(
+        counts,
+        key=lambda name: (name == classify.DEFAULT_CATEGORY, -counts[name], name),
+    )
+    return {
+        "categories": [{"name": name, "count": counts[name]} for name in names],
+        "total": len(docs),
+    }
 
 
 def united_only(docs: list[dict[str, Any]], *, min_items: int = 5) -> list[dict[str, Any]]:

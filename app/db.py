@@ -33,6 +33,7 @@ META = "meta"
 COMMENTS = "comments"
 USERS = "users"
 SESSIONS = "sessions"
+NEWS_SOURCES = "news_sources"
 
 
 def connect() -> Database:
@@ -129,3 +130,7 @@ def ensure_indexes(db: Database) -> None:
     _safe(SESSIONS, [("token", ASCENDING)], unique=True)
     _safe(SESSIONS, [("user_id", ASCENDING)])
     _safe(SESSIONS, [("expires_at", ASCENDING)])
+
+    _safe(NEWS_SOURCES, [("id", ASCENDING)], unique=True)
+    _safe(NEWS_SOURCES, [("url", ASCENDING)], unique=True)
+    _safe(NEWS_SOURCES, [("created_at", ASCENDING)])
