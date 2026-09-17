@@ -273,6 +273,125 @@ def test_derive_standings_aggregates_premier_league_only():
     assert table["Aston Villa"]["lost"] == 1
 
 
+# --- Season schedule (the article's per-competition match tables) ------------ #
+
+_SEASON_MATCH_WIKITEXT = """\
+== Pre-season and friendlies ==
+{| class="wikitable"
+|-
+! Date !! Opponents !! H / A !! Result<br />F–A !! Scorers !! Attendance
+|-
+|29 July 2026||[[Wrexham A.F.C.|Wrexham]]||[[Helsinki Olympic Stadium|N]]||3–1||Fernandes 12'||40,000
+|}
+== Premier League ==
+=== Matches ===
+{| class="wikitable"
+|-
+! Date !! Opponents !! H / A !! Result<br />F–A !! Scorers !! Attendance !! League<br />position
+|-
+|22 August 2026||[[Hull City A.F.C.|Hull City]]||A||[https://www.manutd.com/en/news/hull-0-2 0–2]|| ||24,470||17th
+|-
+|30 August 2026||[[Ipswich Town F.C.|Ipswich Town]]||H||[https://www.manutd.com/en/news/ipswich 5–2]||Fernandes 40', 61' (pen.)||74,148||10th
+|-
+|20 September 2026||[[Fulham F.C.|Fulham]]||A|| || || ||
+|}
+=== League table ===
+{| class="wikitable"
+|-
+! Pos !! Team !! P !! Pts
+|-
+|13||Manchester United||5||4
+|}
+== EFL Cup ==
+{| class="wikitable"
+|-
+! Date !! Round !! Opponents !! H / A !! Result<br />F–A !! Scorers
+|-
+|16 September 2026||Third round||[[Brighton & Hove Albion F.C.|Brighton]]||H|| || 
+|}
+== Transfers ==
+{| class="wikitable"
+|-
+! Date !! Player !! From
+|-
+|1 July 2026||Some Player||Someone
+|}
+"""
+
+
+def test_parse_matches_reads_each_competition_match_table():
+    rows = wikipedia.parse_matches(_SEASON_MATCH_WIKITEXT)
+    assert [(r.competition, r.opponent) for r in rows] == [
+        ("Premier League", "Hull City"),
+        ("Premier League", "Ipswich Town"),
+        ("Premier League", "Fulham"),
+        ("Carabao Cup", "Brighton"),
+    ]
+
+
+def test_parse_matches_skips_friendlies_and_non_match_tables():
+    competitions = {r.competition for r in wikipedia.parse_matches(_SEASON_MATCH_WIKITEXT)}
+    # Pre-season friendlies and the transfers table are not United's season.
+    assert "Wrexham" not in {r.opponent for r in wikipedia.parse_matches(_SEASON_MATCH_WIKITEXT)}
+    assert competitions == {"Premier League", "Carabao Cup"}
+
+
+def test_parse_matches_reads_scores_venues_and_rounds():
+    hull, ipswich, fulham, brighton = wikipedia.parse_matches(_SEASON_MATCH_WIKITEXT)
+    # A filled-in result cell means the match was played; the empty one did not.
+    assert hull.played and (hull.united_goals, hull.opponent_goals) == (0, 2)
+    assert hull.outcome == "L" and hull.position == "17th" and hull.attendance == "24,470"
+    assert not hull.home
+    assert ipswich.home and ipswich.played and ipswich.outcome == "W"
+    assert ipswich.scorers.startswith("Fernandes 40'")
+    assert not fulham.played and fulham.date.isoformat() == "2026-09-20"
+    assert brighton.round == "Third round" and not brighton.played
+
+
+def test_derive_schedule_orients_every_row_around_the_home_club():
+    results, fixtures = hub_service.derive_schedule(
+        wikipedia.parse_matches(_SEASON_MATCH_WIKITEXT)
+    )
+    assert [row["date"] for row in results] == ["30 AUG 2026", "22 AUG 2026"]
+    # United were away at Hull, so Hull is the home club and United's 0-2 is
+    # written the other way round from the season article.
+    hull = results[1]
+    assert (hull["home"], hull["away"]) == ("Hull", "Manchester United")
+    assert (hull["homeScore"], hull["awayScore"]) == (2, 0)
+    assert hull["outcome"] == "loss" and hull["venue"] == "MKM Stadium"
+    ipswich = results[0]
+    assert (ipswich["home"], ipswich["away"]) == ("Manchester United", "Ipswich")
+    assert (ipswich["homeScore"], ipswich["awayScore"]) == (5, 2) and ipswich["outcome"] == "win"
+    # Upcoming fixtures read soonest-first so the next match leads the panel.
+    assert [(row["date"], row["home"]) for row in fixtures] == [
+        ("16 SEP 2026", "Manchester United"),
+        ("20 SEP 2026", "Fulham"),
+    ]
+    assert fixtures[0]["round"] == "Third round" and fixtures[0]["venue"] == "Old Trafford"
+    assert fixtures[1]["away"] == "Manchester United" and "homeScore" not in fixtures[1]
+
+
+def test_derive_overview_counts_united_only_and_reads_the_table_position():
+    results = [
+        {"home": "Manchester United", "away": "Ipswich", "homeScore": 5, "awayScore": 2},
+        {"home": "Hull", "away": "Manchester United", "homeScore": 2, "awayScore": 0},
+        {"home": "Chelsea", "away": "Arsenal", "homeScore": 1, "awayScore": 0},
+    ]
+    standings = [{"team": "Arsenal", "pos": 1, "isUnited": False}, {"team": "Manchester United", "pos": 13, "isUnited": True}]
+    stats = {row["label"]: row for row in hub_service.derive_overview(results, standings, [])["stats"]}
+    assert stats["Matches Played"]["value"] == 2
+    assert stats["Goals Scored"]["value"] == 5 and stats["Goals Scored"]["sub"] == "4 conceded"
+    assert stats["League Position"]["value"] == "13th"
+
+
+def test_derive_overview_falls_back_to_the_last_result_position():
+    results = [
+        {"home": "Hull", "away": "Manchester United", "homeScore": 2, "awayScore": 0, "position": "17th"}
+    ]
+    stats = {row["label"]: row for row in hub_service.derive_overview(results, [], [])["stats"]}
+    assert stats["League Position"]["value"] == "17th"
+
+
 # --- Endpoint integration --------------------------------------------------- #
 
 
@@ -378,7 +497,7 @@ def test_hub_results_section_is_united_only(client, database):
     assert len(body["standings"]) > 1
 
 
-def test_hub_hero_is_a_rotating_pool_of_united_images(client, database):
+def test_hub_hero_is_a_pool_of_united_images(client, database):
     for index in range(3):
         _insert_article(
             database,
@@ -390,9 +509,8 @@ def test_hub_hero_is_a_rotating_pool_of_united_images(client, database):
         )
     hero = client.get("/api/hub/hero").json()
     assert hero["slides"]
-    assert hero["interval_seconds"] > 0
     assert all(slide["image"].startswith("https://") for slide in hero["slides"])
-    # Distinct images only - the pool is for crossfading, not repetition.
+    # Distinct images only - the client shows one per day, so repetition is waste.
     assert len({slide["image"] for slide in hero["slides"]}) == len(hero["slides"])
 
 
@@ -555,3 +673,112 @@ def test_hub_payload_carries_the_standings_provenance(client):
     }
     # Wikipedia is off in tests, so the table comes from the seeded snapshot.
     assert payload["standings_meta"]["source"] in {"SimplyUtd snapshot", "Aggregated from the news feed"}
+
+
+# --- Keeping the season panels current -------------------------------------- #
+
+_ARTICLE_HEADER = (
+    "! Date !! Opponents !! H / A !! Result<br />F\u2013A !! Scorers !! Attendance"
+)
+
+
+def _season_article(played: int, upcoming: int) -> str:
+    """A synthetic season article with ``played`` results and ``upcoming`` games."""
+    rows: list[str] = []
+    for index in range(played):
+        rows.append(
+            f"|{index + 1} August 2026||[[Opponent {index} F.C.|Opponent {index}]]||H||"
+            f"[https://www.manutd.com/en/news/o{index} 2\u20130]|| ||74,000"
+        )
+    for index in range(upcoming):
+        rows.append(
+            f"|{index + 1} October 2026||[[Visitor {index} F.C.|Visitor {index}]]||H|| || ||"
+        )
+    table = "\n|-\n".join(rows)
+    return (
+        "== Premier League ==\n"
+        '{| class="wikitable"\n'
+        f"{_ARTICLE_HEADER}\n"
+        "|-\n"
+        f"{table}\n"
+        "|}\n"
+    )
+
+
+def test_hub_ships_every_match_united_play_that_season(
+    client, rendered_wikipedia, monkeypatch
+):
+    monkeypatch.setattr(wikipedia, "_fetch_rendered", lambda page: None)
+    monkeypatch.setattr(wikipedia, "_fetch_wikitext", lambda page: _season_article(3, 15))
+
+    payload = client.get("/api/hub").json()
+
+    # Both tabs list the whole season: every match played and every one left.
+    assert len(payload["results"]) == 3
+    assert len(payload["fixtures"]) == 15
+    assert payload["schedule_meta"]["fixtures_total"] == 15
+    assert [row["status"] for row in payload["fixtures"]] == ["upcoming"] * 15
+
+
+def test_schedule_is_not_stale_before_the_first_read():
+    wikipedia.reset_cache()
+    assert wikipedia.schedule_stale() is False
+
+
+def test_schedule_is_stale_once_its_interval_passes(rendered_wikipedia, monkeypatch):
+    monkeypatch.setattr(wikipedia, "_fetch_wikitext", lambda page: _season_article(1, 1))
+    wikipedia.fetch_matches()
+    assert wikipedia.schedule_stale() is False
+
+    wikipedia._matches_cache.expires = 0.0  # as if the interval had passed
+    assert wikipedia.schedule_stale() is True
+
+
+def test_hub_revalidate_leaves_a_fresh_schedule_alone(rendered_wikipedia, monkeypatch):
+    calls: list[str] = []
+
+    def fake(page: str) -> str:
+        calls.append(page)
+        return _season_article(1, 1)
+
+    monkeypatch.setattr(wikipedia, "_fetch_wikitext", fake)
+    wikipedia.fetch_matches()
+    seen = len(calls)
+
+    hub_service.revalidate()
+
+    assert len(calls) == seen
+
+
+def test_hub_revalidate_picks_up_a_result_that_landed(rendered_wikipedia, monkeypatch):
+    article = {"body": _season_article(1, 0)}
+    monkeypatch.setattr(wikipedia, "_fetch_rendered", lambda page: None)
+    monkeypatch.setattr(wikipedia, "_fetch_wikitext", lambda page: article["body"])
+    assert len(wikipedia.fetch_matches()) == 1
+
+    article["body"] = _season_article(2, 0)
+    wikipedia._matches_cache.expires = 0.0
+    hub_service.revalidate()
+
+    rows = wikipedia.fetch_matches()
+    assert len(rows) == 2
+    assert (rows[1].united_goals, rows[1].opponent_goals) == (2, 0)
+
+
+def test_hub_route_refreshes_a_stale_schedule(client, rendered_wikipedia, monkeypatch):
+    article = {"body": _season_article(1, 0)}
+    monkeypatch.setattr(wikipedia, "_fetch_rendered", lambda page: None)
+    monkeypatch.setattr(wikipedia, "_fetch_wikitext", lambda page: article["body"])
+    assert len(client.get("/api/hub").json()["results"]) == 1
+
+    article["body"] = _season_article(2, 0)
+    wikipedia._matches_cache.expires = 0.0
+
+    # The stale visit is answered from the season we already hold and the
+    # refresh is queued behind it, so nobody waits on Wikipedia. (The test
+    # client drains background tasks before handing the response back, so the
+    # new result has landed by the time the panel asks again.)
+    stale = client.get("/api/hub")
+    assert stale.headers["cache-control"] == "no-store"
+    assert wikipedia.schedule_stale() is False
+    assert len(client.get("/api/hub").json()["results"]) == 2

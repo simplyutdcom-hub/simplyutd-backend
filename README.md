@@ -19,7 +19,7 @@ pulls Manchester United news (with images).
 | Live | `GET /api/live` (`{items, total, limit, skip}`, `?limit=&skip=`) |
 | Search | `GET /api/search` (`?q=&limit=&skip=`) |
 | Auth | `POST /api/auth/register`, `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/me` |
-| Hub | `GET /api/hub` (incl. rotating `hero`), `GET /api/hub/{section}` |
+| Hub | `GET /api/hub` (incl. a daily-picked `hero`), `GET /api/hub/{section}` |
 | Store | `GET /api/store/products`, `/products/{id}`, `/categories`, `/testimonials`, `/featured`, `POST /products/{id}/click` |
 | Contact | `GET /api/contact/info`, `POST /api/contact` |
 | Newsletter | `POST /api/newsletter/subscribe` |
@@ -300,11 +300,21 @@ MongoDB is required.
 
 ## Deployment (Render)
 
-- **Root directory:** `backend`
+The repository at
+[`simplyutdcom-hub/simplyutd-backend`](https://github.com/simplyutdcom-hub/simplyutd-backend)
+contains the **contents of this `backend/` directory at its root**, so the
+service is deployed with an empty Root Directory.
+
+- **Root directory:** *(leave empty — the repo root is the backend)*
 - **Build command:** `pip install -r requirements.txt`
 - **Start command:** `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+- **Python version:** pinned by [`.python-version`](.python-version)
 - **Environment:** `MONGO_URI`, `MONGO_DB`, `ADMIN_API_KEY`, the `RESEND_*`,
   `CLOUDINARY_*`, `RSS_FEEDS` and `FRONTEND_ORIGINS` variables.
+
+Render's default start command (`uvicorn main:app`) also works: [`main.py`](main.py)
+re-exports the app from `app.main`, and [`Procfile`](Procfile) declares the
+explicit `app.main:app` form.
 
 Point the frontend at the service with `VITE_API_URL` (see
 [`../.env.production`](../.env.production)); CORS additionally allows
