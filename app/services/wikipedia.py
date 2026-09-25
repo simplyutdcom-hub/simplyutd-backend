@@ -102,6 +102,9 @@ class SquadMember:
     cup_goals: int = 0
     yellow: int = 0
     red: int = 0
+    # The season article has no assists column, so this stays zero until the
+    # hub merges Transfermarkt's numbers in (see hub_service.apply_assists).
+    assists: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -110,6 +113,7 @@ class SquadMember:
             "name": self.name,
             "apps": self.apps,
             "goals": self.goals,
+            "assists": self.assists,
             "league_apps": self.league_apps,
             "league_goals": self.league_goals,
             "cup_goals": self.cup_goals,
