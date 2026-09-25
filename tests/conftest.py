@@ -8,6 +8,11 @@ from pathlib import Path
 # Configure the environment BEFORE importing app modules (settings are cached).
 os.environ.setdefault("INGEST_ENABLED", "false")
 os.environ.setdefault("HUB_WIKIPEDIA_ENABLED", "false")
+# The Transfermarkt and SalaryLeaks reads are off in the suite so no test
+# reaches the network; their test modules switch them back on and replace the
+# HTTP call.
+os.environ.setdefault("TRANSFERMARKT_ENABLED", "false")
+os.environ.setdefault("SALARYLEAKS_ENABLED", "false")
 os.environ.setdefault("ADMIN_API_KEY", "test-admin-key")
 os.environ.setdefault("RESEND_API_KEY", "")
 os.environ.setdefault("CLOUDINARY_CLOUD_NAME", "")

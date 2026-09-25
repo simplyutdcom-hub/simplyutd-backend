@@ -111,6 +111,15 @@ results and once for the fixtures still to come.
     return install
 
 
+def _soon(days: int = 5) -> datetime:
+    """A kickoff the route will still see as upcoming.
+
+``NOW`` pins the clock for the service-level tests, but the route reads the
+wall clock, so its fixtures have to be dated from the real present.
+"""
+    return datetime.now(timezone.utc) + timedelta(days=days)
+
+
 def _route_payload(client):
     return client.get("/api/hub/live-match").json()
 
@@ -394,7 +403,7 @@ def test_the_route_returns_nothing_when_united_are_not_playing(client, espn):
 
 
 def test_the_live_match_route_is_never_cached(client, espn):
-    espn([_event(NOW + timedelta(days=5), "pre")])
+    espn([_event(_soon(), "pre")])
     response = client.get("/api/hub/live-match")
 
     assert response.headers["cache-control"] == "no-store"
@@ -462,8 +471,9 @@ def test_there_is_nothing_to_show_without_a_match_or_a_fixture(espn):
 
 
 def test_the_route_carries_the_next_fixture(client, espn):
-    espn([_event(NOW + timedelta(days=5), "pre")])
+    kickoff = _soon()
+    espn([_event(kickoff, "pre")])
     payload = _route_payload(client)
 
     assert payload["match"] is None
-    assert payload["next"]["kickoff"] == _iso(NOW + timedelta(days=5))
+    assert payload["next"]["kickoff"] == _iso(kickoff)
