@@ -142,6 +142,62 @@ class Settings:
         self.hub_form_cache_seconds = _int("HUB_FORM_CACHE_SECONDS", 21600)
         self.hub_form_workers = _int("HUB_FORM_WORKERS", 6)
 
+        # --- Transfermarkt (assists and injuries) --------------------------
+        # Wikipedia's season article carries appearances, goals and cards but
+        # no assists at all, and says nothing about who is currently injured,
+        # so those two panels read Transfermarkt's server-rendered HTML. It is
+        # unofficial and read-only, so both reads are cached well past the
+        # hub's own window and neither is on the critical path of a request.
+        self.transfermarkt_enabled = _bool("TRANSFERMARKT_ENABLED", True)
+        self.transfermarkt_base_url = os.getenv(
+            "TRANSFERMARKT_BASE_URL", "https://www.transfermarkt.com"
+        ).strip().rstrip("/")
+        # United's club id and URL slug, as they appear in the club's URLs.
+        self.transfermarkt_club_id = os.getenv("TRANSFERMARKT_CLUB_ID", "985").strip() or "985"
+        self.transfermarkt_club_path = os.getenv(
+            "TRANSFERMARKT_CLUB_PATH", "manchester-united"
+        ).strip().strip("/") or "manchester-united"
+        # An injury lasts weeks, so the list can be a good while old; assists
+        # change every match but are only a nicety.
+        self.transfermarkt_injury_seconds = _int("TRANSFERMARKT_INJURY_SECONDS", 3600)
+        self.transfermarkt_stats_seconds = _int("TRANSFERMARKT_STATS_SECONDS", 21600)
+        # A failed read is retried sooner, but not so soon that a page which is
+        # down gets asked on every poll.
+        self.transfermarkt_retry_seconds = _int("TRANSFERMARKT_RETRY_SECONDS", 300)
+        self.transfermarkt_http_timeout = float(_int("TRANSFERMARKT_HTTP_TIMEOUT", 12))
+        # The pages are plain HTML, and Transfermarkt turns away agents that do
+        # not look like a browser.
+        self.transfermarkt_user_agent = os.getenv(
+            "TRANSFERMARKT_USER_AGENT",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+        ).strip()
+
+        # --- SalaryLeaks (first-team wages) --------------------------------
+        # No feed the hub reads publishes wages: Wikipedia stops at goals and
+        # cards, and Transfermarkt gives market value rather than pay. So the
+        # wage table is read from SalaryLeaks' server-rendered HTML. Its figures
+        # are reported rather than club-confirmed, it is unofficial, and the
+        # page changes rarely, so the read is cached far past the hub's window.
+        self.salaryleaks_enabled = _bool("SALARYLEAKS_ENABLED", True)
+        self.salaryleaks_base_url = os.getenv(
+            "SALARYLEAKS_BASE_URL", "https://www.salaryleaks.com"
+        ).strip().rstrip("/")
+        self.salaryleaks_club_path = os.getenv(
+            "SALARYLEAKS_CLUB_PATH", "manchester-united"
+        ).strip().strip("/") or "manchester-united"
+        # Wages move at contract renewals, so a day-old read is not stale.
+        self.salaryleaks_seconds = _int("SALARYLEAKS_SECONDS", 43200)
+        # A failed read is retried sooner, but not so soon that a page which is
+        # down gets asked on every poll.
+        self.salaryleaks_retry_seconds = _int("SALARYLEAKS_RETRY_SECONDS", 300)
+        self.salaryleaks_http_timeout = float(_int("SALARYLEAKS_HTTP_TIMEOUT", 12))
+        self.salaryleaks_user_agent = os.getenv(
+            "SALARYLEAKS_USER_AGENT",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+        ).strip()
+
         # --- X feed (the Live United panel) -------------------------------
         # The panel mirrors @SimplyUtd's X timeline. X's own embeds and public
         # syndication endpoints need a paid key or rate limit the server, so the

@@ -24,6 +24,8 @@ _SECTIONS = {
     "standings",
     "compare",
     "squad",
+    "injuries",
+    "salaries",
 }
 
 # Provenance of the payload rather than a panel of its own, so it is only served

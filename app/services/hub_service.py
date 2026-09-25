@@ -23,7 +23,7 @@ from typing import Any
 
 from .. import db as db_module
 from ..config import settings
-from . import feed_rank, form_service, wikipedia
+from . import feed_rank, form_service, salaryleaks, transfermarkt, wikipedia
 from .seed import PLAYER_IMAGES
 
 logger = logging.getLogger("simplyutd.hub")
@@ -733,6 +733,84 @@ def _united_position(
     return next((r["position"] for r in results if r.get("position")), None)
 
 
+def apply_assists(squad: list[wikipedia.SquadMember]) -> list[wikipedia.SquadMember]:
+    """Attach assists to the squad, from Transfermarkt.
+
+    Wikipedia's season article carries no assists column at all - the word does
+    not appear in it - so the numbers are merged in from Transfermarkt's
+    detailed squad statistics, matched on the player's name. A player it does
+    not list simply keeps zero rather than dropping out of the squad.
+    """
+    table = transfermarkt.assists_by_player()
+    if not table:
+        return squad
+    for member in squad:
+        assists = transfermarkt.match_assists(member.name, table)
+        if assists is not None:
+            member.assists = assists
+    return squad
+
+
+def derive_assists(squad: list[wikipedia.SquadMember]) -> list[dict[str, Any]]:
+    """The squad's assist leaders, best first."""
+    return [
+        {
+            "name": _short_name(member.name),
+            "assists": member.assists,
+            "apps": member.apps,
+        }
+        for member in sorted(squad, key=lambda m: (-m.assists, -m.apps))
+        if member.assists > 0
+    ]
+
+
+def derive_injuries() -> dict[str, Any]:
+    """Who is out and for how long, from Transfermarkt.
+
+    Wikipedia says nothing about injuries - its squad table is appearances and
+    goals - so this reads the club's suspensions-and-injuries page instead. An
+    empty list is a real answer here: it means nobody is out.
+    """
+    players = transfermarkt.injuries()
+    return {
+        "players": players,
+        "total": len(players),
+        "days_out": sum(player.get("days_out") or 0 for player in players),
+        "matches_missed": sum(player.get("missed_matches") or 0 for player in players),
+        "source": "Transfermarkt",
+        "updated_at": transfermarkt.injuries_updated_at(),
+    }
+
+
+def derive_salaries() -> dict[str, Any]:
+    """The first-team wage bill, from SalaryLeaks.
+
+    These are reported figures rather than club-confirmed ones - English clubs
+    publish a wage bill in their accounts but never a per-player breakdown - so
+    the payload carries the source's own "last updated" stamp alongside ours.
+    An empty list is a real answer here: it means the panel has nothing to show.
+    """
+    data = salaryleaks.salaries()
+    players = data["players"]
+    totals = data["totals"]
+    earned = [player for player in players if player.get("weekly_amount")]
+    top = max(earned, key=lambda player: player["weekly_amount"], default=None)
+    return {
+        "players": players,
+        "total": len(players),
+        # The source publishes its own totals; they are only recomputed when it
+        # does not, so the panel always adds up to what was published.
+        "weekly_total": totals.get("weekly") or sum(p["weekly_amount"] or 0 for p in players),
+        "annual_total": totals.get("annual") or sum(p["annual_amount"] or 0 for p in players),
+        "bonus_total": totals.get("bonus"),
+        "top_earner": top,
+        "highest_weekly": top["weekly_amount"] if top else None,
+        "source": "SalaryLeaks",
+        "source_updated": data["source_updated"],
+        "updated_at": salaryleaks.salaries_updated_at(),
+    }
+
+
 def derive_overview(
     results: list[dict[str, Any]],
     standings: list[dict[str, Any]],
@@ -769,11 +847,16 @@ def derive_overview(
             "name": _short_name(member.name),
             "goals": member.goals,
             "apps": member.apps,
+            "assists": member.assists,
         }
         for member in sorted(squad, key=lambda m: (-m.goals, -m.apps))
         if member.goals > 0
     ][:5]
-    return {"stats": stats, "top_scorers": scorers}
+    return {
+        "stats": stats,
+        "top_scorers": scorers,
+        "assist_leaders": derive_assists(squad)[:5],
+    }
 
 
 _POSITION_LABEL = {"GK": "Goalkeeper", "DF": "Defender", "MF": "Midfielder", "FW": "Forward"}
@@ -805,6 +888,7 @@ def derive_compare(squad: list[wikipedia.SquadMember]) -> dict[str, Any]:
         "stats": [
             {"label": "Appearances", "a": a.apps, "b": b.apps},
             {"label": "Goals", "a": a.goals, "b": b.goals},
+            {"label": "Assists", "a": a.assists, "b": b.assists},
             {"label": "League Appearances", "a": a.league_apps, "b": b.league_apps},
             {"label": "League Goals", "a": a.league_goals, "b": b.league_goals},
             {"label": "Cup Goals", "a": a.cup_goals, "b": b.cup_goals},
@@ -822,6 +906,7 @@ def derive_squad(squad: list[wikipedia.SquadMember]) -> list[dict[str, Any]]:
             "position": member.position,
             "apps": member.apps,
             "goals": member.goals,
+            "assists": member.assists,
             "league_apps": member.league_apps,
             "league_goals": member.league_goals,
             "cup_goals": member.cup_goals,
@@ -955,11 +1040,13 @@ def build_hub(database) -> dict[str, Any]:
     else:
         standings = derive_standings(standings_source)
         standings_meta = {}
-    squad_members = wikipedia.fetch_squad()
+    squad_members = apply_assists(wikipedia.fetch_squad())
     squad = derive_squad(squad_members)
     overview = derive_overview(united_results, standings, squad_members)
     compare = derive_compare(squad_members)
     hero = derive_hero(items)
+    injuries = derive_injuries()
+    salaries = derive_salaries()
 
     def pick(key: str, derived: Any, *, minimum: int = 1) -> Any:
         if key in overrides:
@@ -1000,6 +1087,8 @@ def build_hub(database) -> dict[str, Any]:
         "schedule_meta": schedule_meta,
         "compare": pick("compare", compare),
         "squad": pick("squad", squad, minimum=5),
+        "injuries": pick("injuries", injuries),
+        "salaries": pick("salaries", salaries),
     }
 
 
@@ -1077,6 +1166,24 @@ async def hub_refresher() -> None:
             raise
         except Exception:  # noqa: BLE001 - the loop must survive any failure
             logger.exception("Scheduled form refresh failed")
+        # These three reads cache themselves for far longer than this loop's
+        # interval, so this only pays for a page whose cache has aged out - but
+        # it keeps that cost off the request path either way.
+        try:
+            squad = await asyncio.to_thread(transfermarkt.squad_stats)
+            out = await asyncio.to_thread(transfermarkt.injuries)
+            wages = await asyncio.to_thread(salaryleaks.salaries)
+            logger.info(
+                "Refreshed Transfermarkt assists (%d players) and injuries (%d out), "
+                "and %d wages",
+                len(squad),
+                len(out),
+                len(wages["players"]),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - the loop must survive any failure
+            logger.exception("Scheduled squad data refresh failed")
         try:
             await asyncio.sleep(interval)
         except asyncio.CancelledError:
